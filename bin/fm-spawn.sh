@@ -102,6 +102,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-worktree-lib.sh
+. "$SCRIPT_DIR/fm-worktree-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -656,6 +658,14 @@ fi
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
 
+# Absolute git-common-dir of the project, resolved once (fm-worktree-lib.sh).
+# Used by the treehouse worktree-detection poll and its post-detection guard to
+# require that a captured pane cwd is a genuine linked worktree of THIS project
+# (shares its common dir) rather than any git repo the pane transiently entered.
+# Empty when PROJ_ABS is not a git work tree; the leased-worktree checks then
+# fail closed rather than record an unverified worktree=.
+PROJ_GIT_COMMON=$(fm_git_common_abs "$PROJ_ABS" 2>/dev/null || true)
+
 real_path_or_raw() {  # <path>
   local path=$1 real
   if real=$(cd "$path" 2>/dev/null && pwd -P); then
@@ -673,8 +683,8 @@ real_path_or_raw() {  # <path>
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
-validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+validate_spawn_worktree() {  # <source> <inspect-target> [leased]
+  local source=$1 inspect_target=$2 require_leased=${3:-} wt_real proj_real wt_top wt_top_real
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -687,6 +697,18 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+  # Post-detection identity guard for treehouse-leased worktrees: the recorded
+  # worktree must be a genuine LINKED worktree of the project (shares its
+  # git-common-dir), not merely a self-consistent git repo. A transient startup
+  # cwd in an unrelated repo (e.g. ~/.oh-my-zsh during oh-my-zsh's update check)
+  # passes the isolation test above but fails here, so it can never be silently
+  # recorded as worktree= (fm-worktree-lib.sh). This is independent of the poll's
+  # own accept test, so a future regression in one cannot make the other silent.
+  if [ "$require_leased" = leased ] \
+    && ! fm_pane_is_leased_worktree "$WT" "$PROJ_ABS_REAL" "$PROJ_GIT_COMMON"; then
+    echo "error: $source recorded '$WT', which is not a linked worktree of the project ($PROJ_ABS); refusing to record a wrong worktree= in the task meta. Inspect target $inspect_target" >&2
     exit 1
   fi
 }
@@ -841,23 +863,32 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
   # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
-  for _ in $(seq 1 60); do
+  # Accept a polled cwd only when it is a genuine linked worktree of THIS project
+  # (shares its git-common-dir), not merely any path that differs from the
+  # project. The weaker "differs from the project" test captured a transient
+  # startup cwd in an unrelated git repo - oh-my-zsh's update check cd's into
+  # $ZSH (~/.oh-my-zsh) before `treehouse get` has entered the real worktree -
+  # and recorded it as worktree= (fm-worktree-lib.sh). PROJ_ABS_REAL is physical,
+  # so a symlinked project prefix cannot make the very first poll misread the
+  # pane's OS-level cwd as already outside the project.
+  # Bounded wait; a permanently-wrong pane (never a leased worktree) fails after
+  # this many 1s polls. Overridable via FM_SPAWN_WORKTREE_POLL_SECS (used by tests
+  # to keep the abort path fast); defaults to the original 60s budget.
+  poll_secs=${FM_SPAWN_WORKTREE_POLL_SECS:-60}
+  for _ in $(seq 1 "$poll_secs"); do
     p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
+    if fm_pane_is_leased_worktree "$p" "$PROJ_ABS_REAL" "$PROJ_GIT_COMMON"; then
       WT="$p"
       break
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    echo "error: treehouse get did not enter the project's worktree within ${poll_secs}s; inspect window $T" >&2
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get" "$T"
+  validate_spawn_worktree "treehouse get" "$T" leased
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
@@ -1029,6 +1060,20 @@ META_WINDOW=$T
   fi
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+
+# Post-write cross-check (treehouse pane path only): re-read the live pane cwd
+# once and confirm the just-recorded worktree= still matches it, so a divergence
+# between the meta and the backend's actual working directory can never be
+# silent. This queries the backend independently of the detection poll; the pane
+# is still the treehouse subshell in the worktree (no agent launched yet, no cd
+# since detection), so a mismatch means the recorded worktree= is wrong.
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  live_cwd=$(spawn_current_path "$WT_TARGET" || true)
+  if [ -z "$live_cwd" ] || [ "$(real_path_or_raw "$live_cwd")" != "$(real_path_or_raw "$WT")" ]; then
+    echo "error: recorded worktree='$WT' does not match the live pane cwd '${live_cwd:-none}'; refusing to launch with a wrong worktree= in the task meta. Inspect window $T" >&2
+    exit 1
+  fi
+fi
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

@@ -181,6 +181,7 @@ run_spawn() {
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$pane" TMUX="fake,1,0" \
+    FM_SPAWN_WORKTREE_POLL_SECS=2 \
     PATH="$fakebin:$PATH" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1
 }
@@ -196,22 +197,27 @@ test_spawn_isolation_abort() {
   mkdir -p "$TMP_ROOT/spawn-notgit" "$proj/sub"
 
   # Abort: the pane resolves to a plain non-git directory (not a worktree at all).
+  # The worktree-detection poll only accepts a genuine linked worktree of the
+  # project, so a non-worktree pane is never recorded; the bounded poll times out.
   out=$(run_spawn "$home" abort-notgit-dd4 "$proj" "$TMP_ROOT/spawn-notgit" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn into a non-worktree dir should abort"
-  assert_contains "$out" "did not yield an isolated worktree" "non-worktree spawn lacked the isolation error"
+  assert_contains "$out" "did not enter the project's worktree" "non-worktree spawn was not rejected by the poll"
   assert_absent "$home/state/abort-notgit-dd4.meta" "aborted spawn must not record meta"
 
-  # Abort: the pane resolves INTO the primary checkout (a subdir of PROJ_ABS).
+  # Abort: the pane resolves INTO the primary checkout (a subdir of PROJ_ABS). It
+  # shares the project's git-common-dir but its toplevel is the primary, so the
+  # poll rejects it (the tangle case) rather than recording it.
   out=$(run_spawn "$home" abort-primary-ee5 "$proj" "$proj/sub" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn landing inside the primary checkout should abort"
-  assert_contains "$out" "did not yield an isolated worktree" "primary-checkout spawn lacked the isolation error"
+  assert_contains "$out" "did not enter the project's worktree" "primary-checkout spawn was not rejected by the poll"
+  assert_absent "$home/state/abort-primary-ee5.meta" "aborted spawn must not record meta"
 
   # Proceed: the pane resolves to a genuine, isolated worktree.
   out=$(run_spawn "$home" ok-isolated-ff6 "$proj" "$TMP_ROOT/spawn-wt" "$fakebin"); status=$?
   expect_code 0 "$status" "spawn into a genuine isolated worktree should succeed"
   assert_contains "$out" "spawned ok-isolated-ff6" "isolated spawn did not report success"
-  assert_not_contains "$out" "did not yield an isolated worktree" "isolated spawn wrongly tripped the guard"
-  pass "fm-spawn: aborts unless the resolved worktree is a genuine, isolated worktree"
+  assert_grep "worktree=$TMP_ROOT/spawn-wt" "$home/state/ok-isolated-ff6.meta" "isolated spawn recorded the wrong worktree="
+  pass "fm-spawn: records only a genuine isolated worktree and aborts on any non-worktree pane"
 }
 
 # --- GUARD 1c: fm-spawn tmux window construction ----------------------------
