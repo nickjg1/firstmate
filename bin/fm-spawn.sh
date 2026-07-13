@@ -1022,33 +1022,63 @@ fi
 # and confirm it still matches the worktree= value about to be recorded, so a
 # divergence between the meta and the backend's actual working directory can
 # never be silently recorded. This queries the backend independently of the
-# detection poll. The treehouse subshell runs the user's shell rc, so the same
-# transient rc-driven cd the poll guards against (oh-my-zsh's update check cd's
-# into $ZSH) can also land on any single sample here; a short bounded retry
-# absorbs such a transient, and only a pane that never returns to the detected
-# worktree aborts. The abort runs before the meta write and removes the
-# task-scoped artifacts already created (turn-end token, task tmp), matching
-# every other spawn abort path: no state that session start, recovery, the
-# watcher, or teardown would treat as a live task.
+# detection poll and splits a divergence by kind:
+#   - a live cwd inside a DIFFERENT leased worktree of this project is a genuine
+#     misdetection (the exact wrong-worktree= bug) and aborts immediately;
+#   - a non-worktree cwd is definitionally the transient case: the treehouse
+#     subshell runs the user's shell rc, and e.g. oh-my-zsh's update check cd's
+#     into $ZSH and can hold the pane there through a multi-second network git
+#     fetch, so it is re-polled at a 1s cadence up to the same
+#     FM_SPAWN_WORKTREE_POLL_SECS budget as the detection poll, and only a pane
+#     that never returns to the detected worktree aborts.
+# Every abort runs before the meta write and removes the task-scoped artifacts
+# this spawn already created (the per-harness turn-end hook files and the task
+# tmp), each removal guarded by the harness that actually wrote it: an aborted
+# spawn writes no meta and gets no teardown, so it must leave zero state that
+# session start, recovery, the watcher, or teardown would treat as a live task.
+spawn_cross_check_abort() {  # <detail>
+  case "$HARNESS" in
+    claude*) rm -f "$WT/.claude/settings.local.json" ;;
+    opencode*) rm -f "$WT/.opencode/plugins/fm-turn-end.js" ;;
+    pi*) rm -f "$STATE/$ID.pi-ext.ts" ;;
+    grok*)
+      rm -f "$STATE/$ID.grok-turnend-token"
+      [ -z "${auth_file:-}" ] || rm -f "$auth_file"
+      rm -f "$WT/.fm-grok-turnend"
+      ;;
+  esac
+  rm -rf "$TASK_TMP"
+  echo "error: $1; refusing to record a wrong worktree= in the task meta. Inspect window $T" >&2
+  exit 1
+}
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   cross_wt_real=$(real_path_or_raw "$WT")
   cross_match=
   live_cwd=
-  for cross_try in 1 2 3 4 5; do
+  for cross_try in $(seq 1 "$poll_secs"); do
     live_cwd=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$live_cwd" ] && [ "$(real_path_or_raw "$live_cwd")" = "$cross_wt_real" ]; then
-      cross_match=1
-      break
+    if [ -n "$live_cwd" ]; then
+      if [ "$(real_path_or_raw "$live_cwd")" = "$cross_wt_real" ]; then
+        cross_match=1
+        break
+      fi
+      if fm_pane_is_leased_worktree "$live_cwd" "$PROJ_ABS_REAL" "$PROJ_GIT_COMMON"; then
+        live_top=$(git -C "$live_cwd" rev-parse --show-toplevel 2>/dev/null || true)
+        live_top_real=
+        if [ -n "$live_top" ]; then
+          live_top_real=$(cd "$live_top" 2>/dev/null && pwd -P) || live_top_real=
+        fi
+        if [ "$live_top_real" = "$cross_wt_real" ]; then
+          cross_match=1
+          break
+        fi
+        spawn_cross_check_abort "detected worktree='$WT' but the live pane cwd '$live_cwd' is a different leased worktree of the project"
+      fi
     fi
-    [ "$cross_try" = 5 ] || sleep 0.3
+    [ "$cross_try" = "$poll_secs" ] || sleep 1
   done
   if [ -z "$cross_match" ]; then
-    rm -f "$STATE/$ID.grok-turnend-token"
-    [ -z "${auth_file:-}" ] || rm -f "$auth_file"
-    rm -f "$WT/.fm-grok-turnend"
-    rm -rf "$TASK_TMP"
-    echo "error: detected worktree='$WT' does not match the live pane cwd '${live_cwd:-none}' after 5 samples; refusing to record a wrong worktree= in the task meta. Inspect window $T" >&2
-    exit 1
+    spawn_cross_check_abort "detected worktree='$WT' does not match the live pane cwd '${live_cwd:-none}' after ${poll_secs}s"
   fi
 fi
 

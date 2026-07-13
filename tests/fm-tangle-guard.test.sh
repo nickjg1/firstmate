@@ -188,16 +188,16 @@ SH
 }
 
 run_spawn() {
-  local home=$1 id=$2 proj=$3 pane=$4 fakebin=$5
+  local home=$1 id=$2 proj=$3 pane=$4 fakebin=$5 harness=${6:-codex}
   mkdir -p "$home/data/$id"
   printf 'brief\n' > "$home/data/$id/brief.md"
   FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$pane" TMUX="fake,1,0" \
-    FM_SPAWN_WORKTREE_POLL_SECS=2 \
+    FM_SPAWN_WORKTREE_POLL_SECS="${FM_SPAWN_WORKTREE_POLL_SECS:-2}" \
     PATH="$fakebin:$PATH" \
-    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" "$harness" 2>&1
 }
 
 test_spawn_isolation_abort() {
@@ -237,8 +237,10 @@ test_spawn_isolation_abort() {
 # The pre-record cross-check re-reads the live pane cwd against the detected
 # worktree before writing the meta. A pane that PERSISTENTLY diverges after
 # detection must abort without stranding any task state (meta, turn-end token,
-# task tmp), while a TRANSIENT rc-driven cd (the oh-my-zsh case) between
-# detection and the cross-check must be absorbed by the bounded retry.
+# task tmp); a TRANSIENT rc-driven cd into a non-worktree dir (the oh-my-zsh
+# case) between detection and the cross-check must be absorbed by the full poll
+# budget; a pane sitting in a DIFFERENT leased worktree of the project is a
+# genuine misdetection and must abort fast, without burning that budget.
 test_spawn_cross_check_divergence() {
   local home proj fakebin seq out status
   home="$TMP_ROOT/cross-home"
@@ -267,7 +269,65 @@ test_spawn_cross_check_divergence() {
   expect_code 0 "$status" "a transient rc-driven cd must not abort the spawn"
   assert_contains "$out" "spawned cross-transient-jj8" "transient-divergence spawn did not report success"
   assert_grep "worktree=$TMP_ROOT/cross-wt" "$home/state/cross-transient-jj8.meta" "transient-divergence spawn recorded the wrong worktree="
-  pass "fm-spawn: cross-check aborts cleanly on persistent divergence and absorbs a transient one"
+
+  # Misdetection: after detection the pane sits in a DIFFERENT leased worktree
+  # of the project. This must abort on the first sample; a regression that sent
+  # it through the transient poll instead would burn the 15s budget below and
+  # then emit the timeout message, failing the message assertion.
+  git -C "$proj" worktree add -q --detach "$TMP_ROOT/cross-wt2" >/dev/null 2>&1
+  seq="$TMP_ROOT/cross-seq-otherwt"
+  printf '%s\n%s\n' "$TMP_ROOT/cross-wt" "$TMP_ROOT/cross-wt2" > "$seq"
+  out=$(FM_SPAWN_WORKTREE_POLL_SECS=15 FM_FAKE_PANE_SEQ="$seq" run_spawn "$home" cross-otherwt-kk9 "$proj" "$TMP_ROOT/cross-wt" "$fakebin"); status=$?
+  expect_code 1 "$status" "a pane in a different leased worktree must abort the spawn"
+  assert_contains "$out" "different leased worktree" "misdetection abort lacked the different-worktree error"
+  assert_absent "$home/state/cross-otherwt-kk9.meta" "aborted spawn must not record meta"
+  [ ! -d "/tmp/fm-cross-otherwt-kk9" ] || fail "aborted spawn must remove its task tmp dir"
+  pass "fm-spawn: cross-check aborts cleanly on persistent divergence, absorbs a transient one, and fails fast on a different worktree"
+}
+
+# The cross-check abort must remove every per-harness artifact the spawn wrote
+# just before it (grok: state token, global-hook auth file, worktree token
+# pointer; pi: the state extension; claude: the worktree-resident Stop hook),
+# because an aborted spawn writes no meta and never gets a teardown.
+test_spawn_cross_check_abort_cleanup() {
+  local home proj fakebin seq grokhome out status auth_leftover
+  home="$TMP_ROOT/clean-home"
+  mkdir -p "$home/data"
+  proj=$(make_repo "$TMP_ROOT/clean-proj")
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/clean-fake")
+  git -C "$proj" worktree add -q --detach "$TMP_ROOT/clean-wt" >/dev/null 2>&1
+  make_repo "$TMP_ROOT/clean-omz" >/dev/null
+  grokhome="$TMP_ROOT/clean-grok-home"
+
+  seq="$TMP_ROOT/clean-seq-grok"
+  printf '%s\n%s\n' "$TMP_ROOT/clean-wt" "$TMP_ROOT/clean-omz" > "$seq"
+  out=$(GROK_HOME="$grokhome" FM_FAKE_PANE_SEQ="$seq" run_spawn "$home" clean-grok-mm1 "$proj" "$TMP_ROOT/clean-wt" "$fakebin" grok); status=$?
+  expect_code 1 "$status" "grok persistent divergence must abort the spawn"
+  assert_contains "$out" "does not match the live pane cwd" "grok abort lacked the cross-check error"
+  assert_absent "$home/state/clean-grok-mm1.meta" "aborted grok spawn must not record meta"
+  assert_absent "$home/state/clean-grok-mm1.grok-turnend-token" "aborted grok spawn must not leave the state token"
+  assert_absent "$TMP_ROOT/clean-wt/.fm-grok-turnend" "aborted grok spawn must not leave the worktree token pointer"
+  auth_leftover=$(find "$grokhome/hooks/fm-turn-end.d" -type f 2>/dev/null || true)
+  [ -z "$auth_leftover" ] || fail "aborted grok spawn must remove its global-hook auth file"
+  [ ! -d "/tmp/fm-clean-grok-mm1" ] || fail "aborted grok spawn must remove its task tmp dir"
+
+  seq="$TMP_ROOT/clean-seq-pi"
+  printf '%s\n%s\n' "$TMP_ROOT/clean-wt" "$TMP_ROOT/clean-omz" > "$seq"
+  out=$(FM_FAKE_PANE_SEQ="$seq" run_spawn "$home" clean-pi-mm2 "$proj" "$TMP_ROOT/clean-wt" "$fakebin" pi); status=$?
+  expect_code 1 "$status" "pi persistent divergence must abort the spawn"
+  assert_contains "$out" "does not match the live pane cwd" "pi abort lacked the cross-check error"
+  assert_absent "$home/state/clean-pi-mm2.meta" "aborted pi spawn must not record meta"
+  assert_absent "$home/state/clean-pi-mm2.pi-ext.ts" "aborted pi spawn must not leave the pi extension"
+
+  seq="$TMP_ROOT/clean-seq-claude"
+  printf '%s\n%s\n' "$TMP_ROOT/clean-wt" "$TMP_ROOT/clean-omz" > "$seq"
+  out=$(FM_FAKE_PANE_SEQ="$seq" run_spawn "$home" clean-claude-mm3 "$proj" "$TMP_ROOT/clean-wt" "$fakebin" claude); status=$?
+  expect_code 1 "$status" "claude persistent divergence must abort the spawn"
+  assert_contains "$out" "does not match the live pane cwd" "claude abort lacked the cross-check error"
+  assert_absent "$home/state/clean-claude-mm3.meta" "aborted claude spawn must not record meta"
+  assert_absent "$TMP_ROOT/clean-wt/.claude/settings.local.json" "aborted claude spawn must not leave the worktree Stop hook"
+
+  pass "fm-spawn: cross-check abort removes every per-harness artifact"
 }
 
 # --- GUARD 1c: fm-spawn tmux window construction ----------------------------
@@ -363,4 +423,5 @@ test_bootstrap_line
 test_brief_assertion_precedes_branch
 test_spawn_isolation_abort
 test_spawn_cross_check_divergence
+test_spawn_cross_check_abort_cleanup
 test_spawn_tmux_window_construction
