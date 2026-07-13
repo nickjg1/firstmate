@@ -83,6 +83,9 @@ Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectab
 
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
 For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout.
+On treehouse-backed backends the worktree is discovered by polling the task pane's cwd, and a polled path is accepted only when it is a genuine linked worktree of the project - it shares the project's git-common-dir and its toplevel is not the primary checkout - so a transient shell-startup cd into an unrelated git repo can never be recorded as the task worktree (`fm-worktree-lib.sh`).
+Before writing the task meta, `fm-spawn.sh` independently re-reads the live pane cwd and aborts cleanly (removing its task-scoped artifacts, writing no meta) if the pane has settled in a different leased worktree or never returns to the detected one, so `worktree=` never diverges from where the crewmate actually runs.
+Both the detection poll and that cross-check are budgeted by `FM_SPAWN_WORKTREE_POLL_SECS` (default 60s).
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
 Its operating checkout (`FM_ROOT`) and the disposable crewmate worktrees are all linked git worktrees of the same repository, so the valid discriminator is branch state, not whether the checkout is linked.

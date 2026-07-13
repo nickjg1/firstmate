@@ -371,6 +371,7 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive provably-working stale escalati
 FM_WATCH_TRIAGE_LOG_MAX_BYTES=262144   # size cap for the watcher's absorbed-wake debug log
 FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=     # optional seconds allowed for bootstrap's best-effort clone refresh; unset/blank defaults to max(20, 5 + 3 * origin-backed-project-count)
 FM_FLEET_PRUNE=1        # set to 0 to skip pruning local branches whose upstream is gone
+FM_SPAWN_WORKTREE_POLL_SECS=60           # seconds fm-spawn.sh polls the task pane for the treehouse-leased worktree, in both the detection poll and the pre-meta-write live-pane cross-check (bin/fm-worktree-lib.sh)
 FM_STALE_WORKTREE_LOCK_AGE_SECS=30       # min mtime age before fm-teardown.sh treats a leftover worktree git index.lock as provably stale
 FM_TREEHOUSE_RETURN_LOCK_RETRIES=3        # retries after a treehouse return fails on the transient git index.lock signature
 FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=1 # seconds fm-teardown.sh waits before each retry after that signature

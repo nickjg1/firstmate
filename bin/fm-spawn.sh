@@ -79,6 +79,16 @@
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> mode=<mode> yolo=<on|off> window=<backend-target> worktree=<path>
 # mode/yolo are resolved per-project from data/projects.md for ship/scout tasks;
 # secondmate spawns record mode=secondmate, yolo=off, home=, and projects=.
+# Treehouse-backed ship/scout spawns (every backend but orca) discover the
+# worktree by polling the task pane's cwd, accepting only a genuine LINKED
+# worktree of the project - one sharing its git-common-dir whose toplevel is not
+# the primary checkout (fm-worktree-lib.sh) - so a transient shell-startup cd
+# into an unrelated git repo is never recorded as worktree=. Before the meta
+# write, an independent cross-check re-reads the live pane cwd and aborts
+# cleanly (removing this spawn's task-scoped artifacts, writing no meta) if the
+# pane settled in a different leased worktree or never returns to the detected
+# one. Both the poll and the cross-check are budgeted by
+# FM_SPAWN_WORKTREE_POLL_SECS seconds (default 60) at a 1s cadence.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
