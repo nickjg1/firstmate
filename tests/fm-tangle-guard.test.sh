@@ -151,7 +151,10 @@ test_brief_assertion_precedes_branch() {
 
 # A fake tmux that reports FM_FAKE_PANE_PATH as the post-`treehouse get` pane cwd
 # (so the spawn's worktree-resolution loop resolves to a path we control), names
-# the session on '#S', and swallows window ops. Echoes the fakebin dir.
+# the session on '#S', and swallows window ops. When FM_FAKE_PANE_SEQ names a
+# file, each pane-cwd query instead pops the next line from it (repeating the
+# last line once exhausted), so a test can make the pane path CHANGE between the
+# detection poll and the pre-record cross-check. Echoes the fakebin dir.
 make_spawn_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -159,7 +162,18 @@ make_spawn_fakebin() {
 #!/usr/bin/env bash
 set -u
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_path}"*)
+    if [ -n "${FM_FAKE_PANE_SEQ:-}" ] && [ -f "$FM_FAKE_PANE_SEQ" ]; then
+      n=$(cat "$FM_FAKE_PANE_SEQ.n" 2>/dev/null || echo 0)
+      n=$((n + 1))
+      printf '%s\n' "$n" > "$FM_FAKE_PANE_SEQ.n"
+      total=$(grep -c '' "$FM_FAKE_PANE_SEQ")
+      [ "$n" -le "$total" ] || n=$total
+      sed -n "${n}p" "$FM_FAKE_PANE_SEQ"
+    else
+      printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    fi
+    exit 0 ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
@@ -218,6 +232,42 @@ test_spawn_isolation_abort() {
   assert_contains "$out" "spawned ok-isolated-ff6" "isolated spawn did not report success"
   assert_grep "worktree=$TMP_ROOT/spawn-wt" "$home/state/ok-isolated-ff6.meta" "isolated spawn recorded the wrong worktree="
   pass "fm-spawn: records only a genuine isolated worktree and aborts on any non-worktree pane"
+}
+
+# The pre-record cross-check re-reads the live pane cwd against the detected
+# worktree before writing the meta. A pane that PERSISTENTLY diverges after
+# detection must abort without stranding any task state (meta, turn-end token,
+# task tmp), while a TRANSIENT rc-driven cd (the oh-my-zsh case) between
+# detection and the cross-check must be absorbed by the bounded retry.
+test_spawn_cross_check_divergence() {
+  local home proj fakebin seq out status
+  home="$TMP_ROOT/cross-home"
+  mkdir -p "$home/data"
+  proj=$(make_repo "$TMP_ROOT/cross-proj")
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/cross-fake")
+  git -C "$proj" worktree add -q --detach "$TMP_ROOT/cross-wt" >/dev/null 2>&1
+  make_repo "$TMP_ROOT/cross-omz" >/dev/null
+
+  # Persistent divergence: detection sees the real worktree, every later sample
+  # sees an unrelated repo. The spawn must abort and leave no task artifacts.
+  seq="$TMP_ROOT/cross-seq-persist"
+  printf '%s\n%s\n' "$TMP_ROOT/cross-wt" "$TMP_ROOT/cross-omz" > "$seq"
+  out=$(FM_FAKE_PANE_SEQ="$seq" run_spawn "$home" cross-diverge-hh7 "$proj" "$TMP_ROOT/cross-wt" "$fakebin"); status=$?
+  expect_code 1 "$status" "a persistently diverged pane must abort the spawn"
+  assert_contains "$out" "does not match the live pane cwd" "diverged spawn lacked the cross-check error"
+  assert_absent "$home/state/cross-diverge-hh7.meta" "aborted spawn must not record meta"
+  assert_absent "$home/state/cross-diverge-hh7.grok-turnend-token" "aborted spawn must not leave a turn-end token"
+  [ ! -d "/tmp/fm-cross-diverge-hh7" ] || fail "aborted spawn must remove its task tmp dir"
+
+  # Transient divergence: one contaminated sample between detection and the
+  # cross-check, then the pane is back in the worktree. The retry must absorb it.
+  seq="$TMP_ROOT/cross-seq-transient"
+  printf '%s\n%s\n%s\n' "$TMP_ROOT/cross-wt" "$TMP_ROOT/cross-omz" "$TMP_ROOT/cross-wt" > "$seq"
+  out=$(FM_FAKE_PANE_SEQ="$seq" run_spawn "$home" cross-transient-jj8 "$proj" "$TMP_ROOT/cross-wt" "$fakebin"); status=$?
+  expect_code 0 "$status" "a transient rc-driven cd must not abort the spawn"
+  assert_contains "$out" "spawned cross-transient-jj8" "transient-divergence spawn did not report success"
+  assert_grep "worktree=$TMP_ROOT/cross-wt" "$home/state/cross-transient-jj8.meta" "transient-divergence spawn recorded the wrong worktree="
+  pass "fm-spawn: cross-check aborts cleanly on persistent divergence and absorbs a transient one"
 }
 
 # --- GUARD 1c: fm-spawn tmux window construction ----------------------------
@@ -312,4 +362,5 @@ test_guard_banner
 test_bootstrap_line
 test_brief_assertion_precedes_branch
 test_spawn_isolation_abort
+test_spawn_cross_check_divergence
 test_spawn_tmux_window_construction

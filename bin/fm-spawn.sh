@@ -1018,6 +1018,40 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
 
+# Pre-record cross-check (treehouse pane path only): re-read the live pane cwd
+# and confirm it still matches the worktree= value about to be recorded, so a
+# divergence between the meta and the backend's actual working directory can
+# never be silently recorded. This queries the backend independently of the
+# detection poll. The treehouse subshell runs the user's shell rc, so the same
+# transient rc-driven cd the poll guards against (oh-my-zsh's update check cd's
+# into $ZSH) can also land on any single sample here; a short bounded retry
+# absorbs such a transient, and only a pane that never returns to the detected
+# worktree aborts. The abort runs before the meta write and removes the
+# task-scoped artifacts already created (turn-end token, task tmp), matching
+# every other spawn abort path: no state that session start, recovery, the
+# watcher, or teardown would treat as a live task.
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  cross_wt_real=$(real_path_or_raw "$WT")
+  cross_match=
+  live_cwd=
+  for cross_try in 1 2 3 4 5; do
+    live_cwd=$(spawn_current_path "$WT_TARGET" || true)
+    if [ -n "$live_cwd" ] && [ "$(real_path_or_raw "$live_cwd")" = "$cross_wt_real" ]; then
+      cross_match=1
+      break
+    fi
+    [ "$cross_try" = 5 ] || sleep 0.3
+  done
+  if [ -z "$cross_match" ]; then
+    rm -f "$STATE/$ID.grok-turnend-token"
+    [ -z "${auth_file:-}" ] || rm -f "$auth_file"
+    rm -f "$WT/.fm-grok-turnend"
+    rm -rf "$TASK_TMP"
+    echo "error: detected worktree='$WT' does not match the live pane cwd '${live_cwd:-none}' after 5 samples; refusing to record a wrong worktree= in the task meta. Inspect window $T" >&2
+    exit 1
+  fi
+fi
+
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 {
@@ -1060,20 +1094,6 @@ META_WINDOW=$T
   fi
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
-
-# Post-write cross-check (treehouse pane path only): re-read the live pane cwd
-# once and confirm the just-recorded worktree= still matches it, so a divergence
-# between the meta and the backend's actual working directory can never be
-# silent. This queries the backend independently of the detection poll; the pane
-# is still the treehouse subshell in the worktree (no agent launched yet, no cd
-# since detection), so a mismatch means the recorded worktree= is wrong.
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  live_cwd=$(spawn_current_path "$WT_TARGET" || true)
-  if [ -z "$live_cwd" ] || [ "$(real_path_or_raw "$live_cwd")" != "$(real_path_or_raw "$WT")" ]; then
-    echo "error: recorded worktree='$WT' does not match the live pane cwd '${live_cwd:-none}'; refusing to launch with a wrong worktree= in the task meta. Inspect window $T" >&2
-    exit 1
-  fi
-fi
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
