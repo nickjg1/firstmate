@@ -79,6 +79,16 @@
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> mode=<mode> yolo=<on|off> window=<backend-target> worktree=<path>
 # mode/yolo are resolved per-project from data/projects.md for ship/scout tasks;
 # secondmate spawns record mode=secondmate, yolo=off, home=, and projects=.
+# Treehouse-backed ship/scout spawns (every backend but orca) discover the
+# worktree by polling the task pane's cwd, accepting only a genuine LINKED
+# worktree of the project - one sharing its git-common-dir whose toplevel is not
+# the primary checkout (fm-worktree-lib.sh) - so a transient shell-startup cd
+# into an unrelated git repo is never recorded as worktree=. Before the meta
+# write, an independent cross-check re-reads the live pane cwd and aborts
+# cleanly (removing this spawn's task-scoped artifacts, writing no meta) if the
+# pane settled in a different leased worktree or never returns to the detected
+# one. Both the poll and the cross-check are budgeted by
+# FM_SPAWN_WORKTREE_POLL_SECS seconds (default 60) at a 1s cadence.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,6 +112,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-worktree-lib.sh
+. "$SCRIPT_DIR/fm-worktree-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -656,6 +668,14 @@ fi
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
 
+# Absolute git-common-dir of the project, resolved once (fm-worktree-lib.sh).
+# Used by the treehouse worktree-detection poll and its post-detection guard to
+# require that a captured pane cwd is a genuine linked worktree of THIS project
+# (shares its common dir) rather than any git repo the pane transiently entered.
+# Empty when PROJ_ABS is not a git work tree; the leased-worktree checks then
+# fail closed rather than record an unverified worktree=.
+PROJ_GIT_COMMON=$(fm_git_common_abs "$PROJ_ABS" 2>/dev/null || true)
+
 real_path_or_raw() {  # <path>
   local path=$1 real
   if real=$(cd "$path" 2>/dev/null && pwd -P); then
@@ -673,8 +693,8 @@ real_path_or_raw() {  # <path>
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
-validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+validate_spawn_worktree() {  # <source> <inspect-target> [leased]
+  local source=$1 inspect_target=$2 require_leased=${3:-} wt_real proj_real wt_top wt_top_real
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -687,6 +707,18 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+  # Post-detection identity guard for treehouse-leased worktrees: the recorded
+  # worktree must be a genuine LINKED worktree of the project (shares its
+  # git-common-dir), not merely a self-consistent git repo. A transient startup
+  # cwd in an unrelated repo (e.g. ~/.oh-my-zsh during oh-my-zsh's update check)
+  # passes the isolation test above but fails here, so it can never be silently
+  # recorded as worktree= (fm-worktree-lib.sh). This is independent of the poll's
+  # own accept test, so a future regression in one cannot make the other silent.
+  if [ "$require_leased" = leased ] \
+    && ! fm_pane_is_leased_worktree "$WT" "$PROJ_ABS_REAL" "$PROJ_GIT_COMMON"; then
+    echo "error: $source recorded '$WT', which is not a linked worktree of the project ($PROJ_ABS); refusing to record a wrong worktree= in the task meta. Inspect target $inspect_target" >&2
     exit 1
   fi
 }
@@ -841,23 +873,32 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
   # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
-  for _ in $(seq 1 60); do
+  # Accept a polled cwd only when it is a genuine linked worktree of THIS project
+  # (shares its git-common-dir), not merely any path that differs from the
+  # project. The weaker "differs from the project" test captured a transient
+  # startup cwd in an unrelated git repo - oh-my-zsh's update check cd's into
+  # $ZSH (~/.oh-my-zsh) before `treehouse get` has entered the real worktree -
+  # and recorded it as worktree= (fm-worktree-lib.sh). PROJ_ABS_REAL is physical,
+  # so a symlinked project prefix cannot make the very first poll misread the
+  # pane's OS-level cwd as already outside the project.
+  # Bounded wait; a permanently-wrong pane (never a leased worktree) fails after
+  # this many 1s polls. Overridable via FM_SPAWN_WORKTREE_POLL_SECS (used by tests
+  # to keep the abort path fast); defaults to the original 60s budget.
+  poll_secs=${FM_SPAWN_WORKTREE_POLL_SECS:-60}
+  for _ in $(seq 1 "$poll_secs"); do
     p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
+    if fm_pane_is_leased_worktree "$p" "$PROJ_ABS_REAL" "$PROJ_GIT_COMMON"; then
       WT="$p"
       break
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    echo "error: treehouse get did not enter the project's worktree within ${poll_secs}s; inspect window $T" >&2
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get" "$T"
+  validate_spawn_worktree "treehouse get" "$T" leased
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
@@ -985,6 +1026,70 @@ else
   read -r MODE YOLO <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
+fi
+
+# Pre-record cross-check (treehouse pane path only): re-read the live pane cwd
+# and confirm it still matches the worktree= value about to be recorded, so a
+# divergence between the meta and the backend's actual working directory can
+# never be silently recorded. This queries the backend independently of the
+# detection poll and splits a divergence by kind:
+#   - a live cwd inside a DIFFERENT leased worktree of this project is a genuine
+#     misdetection (the exact wrong-worktree= bug) and aborts immediately;
+#   - a non-worktree cwd is definitionally the transient case: the treehouse
+#     subshell runs the user's shell rc, and e.g. oh-my-zsh's update check cd's
+#     into $ZSH and can hold the pane there through a multi-second network git
+#     fetch, so it is re-polled at a 1s cadence up to the same
+#     FM_SPAWN_WORKTREE_POLL_SECS budget as the detection poll, and only a pane
+#     that never returns to the detected worktree aborts.
+# Every abort runs before the meta write and removes the task-scoped artifacts
+# this spawn already created (the per-harness turn-end hook files and the task
+# tmp), each removal guarded by the harness that actually wrote it: an aborted
+# spawn writes no meta and gets no teardown, so it must leave zero state that
+# session start, recovery, the watcher, or teardown would treat as a live task.
+spawn_cross_check_abort() {  # <detail>
+  case "$HARNESS" in
+    claude*) rm -f "$WT/.claude/settings.local.json" ;;
+    opencode*) rm -f "$WT/.opencode/plugins/fm-turn-end.js" ;;
+    pi*) rm -f "$STATE/$ID.pi-ext.ts" ;;
+    grok*)
+      rm -f "$STATE/$ID.grok-turnend-token"
+      [ -z "${auth_file:-}" ] || rm -f "$auth_file"
+      rm -f "$WT/.fm-grok-turnend"
+      ;;
+  esac
+  rm -rf "$TASK_TMP"
+  echo "error: $1; refusing to record a wrong worktree= in the task meta. Inspect window $T" >&2
+  exit 1
+}
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  cross_wt_real=$(real_path_or_raw "$WT")
+  cross_match=
+  live_cwd=
+  for cross_try in $(seq 1 "$poll_secs"); do
+    live_cwd=$(spawn_current_path "$WT_TARGET" || true)
+    if [ -n "$live_cwd" ]; then
+      if [ "$(real_path_or_raw "$live_cwd")" = "$cross_wt_real" ]; then
+        cross_match=1
+        break
+      fi
+      if fm_pane_is_leased_worktree "$live_cwd" "$PROJ_ABS_REAL" "$PROJ_GIT_COMMON"; then
+        live_top=$(git -C "$live_cwd" rev-parse --show-toplevel 2>/dev/null || true)
+        live_top_real=
+        if [ -n "$live_top" ]; then
+          live_top_real=$(cd "$live_top" 2>/dev/null && pwd -P) || live_top_real=
+        fi
+        if [ "$live_top_real" = "$cross_wt_real" ]; then
+          cross_match=1
+          break
+        fi
+        spawn_cross_check_abort "detected worktree='$WT' but the live pane cwd '$live_cwd' is a different leased worktree of the project"
+      fi
+    fi
+    [ "$cross_try" = "$poll_secs" ] || sleep 1
+  done
+  if [ -z "$cross_match" ]; then
+    spawn_cross_check_abort "detected worktree='$WT' does not match the live pane cwd '${live_cwd:-none}' after ${poll_secs}s"
+  fi
 fi
 
 META_WINDOW=$T
