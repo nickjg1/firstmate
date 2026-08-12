@@ -131,6 +131,42 @@ clip() {
   awk -v max="$LINE_MAX" '{ if (length($0) > max) print substr($0, 1, max) " …"; else print }'
 }
 
+clip_routing_entry() {
+  awk -v max="$LINE_MAX" '
+    function trim_middle(prefix, body, suffix, room) {
+      if (length(prefix body suffix) <= max) return prefix body suffix
+      room = max - length(prefix) - length(suffix)
+      if (room > 2) return prefix substr(body, 1, room - 2) " …" suffix
+      return prefix suffix
+    }
+    {
+      line = $0
+      open = index(line, " (home: ")
+      if (open > 0) {
+        identity_match = match(line, /^- [^ ]+ - /)
+        if (identity_match > 0) {
+          prefix = substr(line, 1, identity_match + RLENGTH - 1)
+          body = substr(line, identity_match + RLENGTH, open - identity_match - RLENGTH)
+          suffix = substr(line, open)
+          print trim_middle(prefix, body, suffix)
+          next
+        }
+      }
+      added = index(line, " (added ")
+      mode_end = index(line, "] - ")
+      if (added > 0 && mode_end > 0) {
+        prefix = substr(line, 1, mode_end + 3)
+        body = substr(line, mode_end + 4, added - mode_end - 4)
+        suffix = substr(line, added)
+        print trim_middle(prefix, body, suffix)
+        next
+      }
+      if (length(line) > max) print substr(line, 1, max) " …"
+      else print line
+    }
+  '
+}
+
 # file_size <path>: byte count, or 0 when unreadable.
 file_size() {
   wc -c < "$1" 2>/dev/null | tr -d '[:space:]'
@@ -351,7 +387,7 @@ if print_file_header "$DATA/projects.md" "data/projects.md"; then
   else
     summary_line "$DATA/projects.md"
     printf 'Registry entries (name, mode, +yolo, clipped description):\n'
-    grep '^- ' "$DATA/projects.md" 2>/dev/null | clip | sed 's/^/  /'
+    grep '^- ' "$DATA/projects.md" 2>/dev/null | clip_routing_entry | sed 's/^/  /'
     pointer "registry" "cat $DATA/projects.md"
   fi
 fi
@@ -362,7 +398,7 @@ if print_file_header "$DATA/secondmates.md" "data/secondmates.md"; then
   else
     summary_line "$DATA/secondmates.md"
     printf 'Routing table (id, scope, home, clipped):\n'
-    grep '^- ' "$DATA/secondmates.md" 2>/dev/null | clip | sed 's/^/  /'
+    grep '^- ' "$DATA/secondmates.md" 2>/dev/null | clip_routing_entry | sed 's/^/  /'
     pointer "routing table" "cat $DATA/secondmates.md"
   fi
 fi
@@ -405,7 +441,7 @@ if print_file_header "$DATA/backlog.md" "data/backlog.md"; then
     # Only column-zero list items are ITEMS; an indented dash is a note inside
     # the item above it (the backlog's free-form note form), and counting those
     # would both inflate the counts and drag note prose into the digest.
-    awk -v max="$LINE_MAX" -v cap="$INDEX_MAX" '
+    awk -v max="$LINE_MAX" '
       /^## / { sect = substr($0, 4); counts[sect] = 0; order[++n] = sect; next }
       /^- / {
         if (sect == "") next
@@ -422,8 +458,7 @@ if print_file_header "$DATA/backlog.md" "data/backlog.md"; then
         printf "\n"
         if (f > 0) {
           print "In flight (the queue this turn acts on):"
-          for (i = 1; i <= f && i <= cap; i++) print "  " inflight[i]
-          if (f > cap) printf "  ... %d more in flight (capped at %d)\n", f - cap, cap
+          for (i = 1; i <= f; i++) print "  " inflight[i]
         }
       }
     ' "$DATA/backlog.md"
@@ -460,7 +495,7 @@ for meta in "$STATE"/*.meta; do
   fi
   printf '%s · %s%s · %s%s · last: %s\n' \
     "$id" "$kind" "${mode:+/$mode}" "$endpoint" "${pr:+ · pr=$pr}" \
-    "$(print_status_last "$STATE/$id.status")" | clip
+    "$(print_status_last "$STATE/$id.status")"
   print_status_extra "$STATE/$id.status"
 done
 if [ "$META_FOUND" -eq 1 ]; then

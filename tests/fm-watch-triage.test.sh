@@ -251,6 +251,22 @@ test_crew_absorb_class_terminal_run_classifier() {
   [ "$(crew_absorb_class nopr "$state")" = none ] \
     || fail "a done run with NO recorded pr= must still surface (firstmate has not been told yet)"
 
+  fm_write_meta "$state/passed.meta" "window=test:fm-passed" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/8"
+  printf 'done: PR https://example.test/owner/repo/pull/8 checks green\n' > "$state/passed.status"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · run passed: PR merged/closed'
+  [ "$(crew_absorb_class passed "$state")" = none ] \
+    || fail "a passed/merged-or-closed run was classed awaiting-merge"
+  ! crew_is_awaiting_merge passed "$state" \
+    || fail "a passed/merged-or-closed run entered the awaiting-merge class"
+
+  fm_write_meta "$state/coarse.meta" "window=test:fm-coarse" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/10"
+  printf 'done: PR https://example.test/owner/repo/pull/10 checks green\n' > "$state/coarse.status"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · run completed'
+  [ "$(crew_absorb_class coarse "$state")" = none ] \
+    || fail "an ambiguous completed run was classed awaiting-merge"
+
   # A pause declared while the run is terminal is honoured (original c2 report).
   fm_write_meta "$state/cancelled.meta" "window=test:fm-cancelled" "kind=ship"
   printf 'working: fixing\npaused: awaiting the upstream release\n' > "$state/cancelled.status"
@@ -270,7 +286,7 @@ test_crew_absorb_class_terminal_run_classifier() {
     || fail "run-step precedence for an ACTIVE run was weakened by the terminal-run branch"
 
   unset FM_FAKE_CREW_STATE
-  pass "crew_absorb_class: a terminal run yields awaiting-merge on a recorded pr= and honours a declared pause, while an active run keeps precedence"
+  pass "crew_absorb_class: only checks-passed is awaiting-merge; passed or ambiguous terminal runs surface"
 }
 
 # signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY

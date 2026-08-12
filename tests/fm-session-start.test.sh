@@ -464,6 +464,39 @@ EOF
   pass "the digest prints one wake event per task by default, with a knob for more and a pointer to the full log"
 }
 
+test_summary_clipping_preserves_routing_and_task_fields() {
+  local rec root home fakebin out task_line long_description
+  rec=$(new_world structured-summary)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:live"
+
+  long_description=$(head -c 500 /dev/zero | tr '\0' 'x')
+  printf -- '- route-a - %s (home: %s; scope: scope-that-must-survive-summary-clipping; projects: alpha; added 2026-08-12)\n' \
+    "$long_description" "$home/route-a" > "$home/data/secondmates.md"
+  printf -- '- app [no-mistakes] - %s (added 2026-08-12)\n' "$long_description" > "$home/data/projects.md"
+  printf 'window=fm-sess:live\nkind=ship\nmode=no-mistakes\npr=https://example.test/o/r/pull/123\n' \
+    > "$home/state/task-a.meta"
+  printf 'done: %s\n' "$(head -c 500 /dev/zero | tr '\0' 'z')" > "$home/state/task-a.status"
+
+  out=$(FM_SESSION_START_FULL_BYTES=1 FM_SESSION_START_LINE_MAX=80 \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "- route-a -" "the summarized secondmate line dropped its identity"
+  assert_contains "$out" "home: $home/route-a" "the summarized secondmate line dropped its home"
+  assert_contains "$out" "scope: scope-that-must-survive-summary-clipping" \
+    "the summarized secondmate line clipped its routing scope"
+  assert_contains "$out" "- app [no-mistakes] -" "the summarized project line dropped its mode"
+  assert_contains "$out" "(added 2026-08-12)" "the summarized project line clipped its structured date"
+  task_line=$(printf '%s\n' "$out" | grep '^task-a · ' | head -1)
+  assert_contains "$task_line" "tmux fm-sess:live endpoint=alive" "the task line dropped its endpoint liveness"
+  assert_contains "$task_line" "pr=https://example.test/o/r/pull/123" "the task line clipped its recorded PR"
+  assert_contains "$task_line" "last: done:" "the task line dropped its status field"
+  pass "summary clipping preserves routing fields and task routing fields while clipping only prose"
+}
+
 # The lean digest's whole purpose: the session-start output that lands in the
 # conversation - and is therefore re-read as context on EVERY later turn - must
 # not scale with the size of the home's data/ files. This test grows those files
@@ -493,7 +526,13 @@ EOF
     printf '## Communication style\n\nCAPTAIN-BODY %s\n\n' "$(head -c 3000 /dev/zero | tr '\0' 'y')"
   } > "$home/data/captain.md"
   {
-    printf '## In flight\n- [ ] live-task-a1 - the one in flight (repo: x)\n\n## Queued\n'
+    printf '## In flight\n- [ ] live-task-a1 - the one in flight (repo: x)\n'
+    i=2
+    while [ "$i" -le 45 ]; do
+      printf -- '- [ ] live-task-%s - another in-flight item\n' "$i"
+      i=$((i + 1))
+    done
+    printf '\n## Queued\n'
     i=1
     while [ "$i" -le 40 ]; do
       printf -- '- [ ] queued-%s - QUEUED-BODY-%s %s\n' "$i" "$i" "$(head -c 300 /dev/zero | tr '\0' 'z')"
@@ -518,8 +557,9 @@ EOF
   # ...while everything a first turn acts on stays in.
   assert_contains "$out" "learning 17 headline" "the learnings heading index dropped an entry"
   assert_contains "$out" "Communication style" "the captain heading index dropped an entry"
-  assert_contains "$out" "In flight=1" "the backlog summary lost its section counts"
+  assert_contains "$out" "In flight=45" "the backlog summary lost its section counts"
   assert_contains "$out" "live-task-a1" "the backlog summary dropped an in-flight item"
+  assert_contains "$out" "live-task-45" "the backlog summary capped the in-flight item list"
   assert_contains "$out" "task-a" "the fleet digest dropped an in-flight task"
   assert_contains "$out" "pr=https://example.test/o/r/pull/9" "the task line dropped its recorded PR"
   assert_contains "$out" "endpoint=alive" "the task line dropped its endpoint liveness"
@@ -855,6 +895,7 @@ test_lock_refusal_read_only_path
 test_output_ordering_diagnostics_lead
 test_herdr_backend_diagnostics_follow_real_session_start
 test_status_tail_bounding
+test_summary_clipping_preserves_routing_and_task_fields
 test_digest_stays_lean_as_data_grows
 test_small_home_digest_is_unsummarized
 test_orphan_status_logs_are_printed

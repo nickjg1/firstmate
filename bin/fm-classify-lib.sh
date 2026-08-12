@@ -155,6 +155,14 @@ map_log_state() {  # <status-line> -> working|parked|blocked|paused|done|failed|
   esac
 }
 
+terminal_outcome() {  # <state/detail line> -> checks-passed|passed|unknown
+  case "$1" in
+    *"checks green: PR ready for review"*) printf 'checks-passed' ;;
+    *"run passed: PR merged/closed"*) printf 'passed' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 status_line_note() {  # <status-line> -> text after the first colon, trimmed
   case "$1" in
     *:*) local n=${1#*:}; printf '%s' "${n#"${n%%[![:space:]]*}"}" ;;
@@ -279,9 +287,9 @@ task_pr_recorded() {  # <id> <state>
 #   working        - an actively-running no-mistakes step (running/fixing/ci) or a
 #                    busy pane; the crew is legitimately mid-work on a
 #                    static-looking pane (e.g. waiting on CI);
-#   awaiting-merge - the run reached a TERMINAL done outcome (checks-passed or
-#                    passed) and the task meta records a pr=, so the crew is
-#                    parked on a green PR firstmate already knows about;
+#   awaiting-merge - the run reached a TERMINAL checks-passed outcome and the
+#                    task meta records a pr=, so the crew is parked on a green
+#                    PR firstmate already knows about;
 #   paused         - the crew's authoritative current state is a declared
 #                    external-wait pause (paused:), which is EXPECTED to idle, OR
 #                    the run is terminal and the status log declares a pause (see
@@ -306,7 +314,7 @@ task_pr_recorded() {  # <id> <state>
 # run it only on no-verb signal and first-sighting stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id> [<state>]
-  local id=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} line crew_state src
+  local id=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} line crew_state src outcome
   [ -n "$id" ] || { printf 'none'; return; }
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
@@ -319,8 +327,14 @@ crew_absorb_class() {  # <id> [<state>]
   fi
   case "$crew_state" in
     done|failed)
-      if [ "$crew_state" = "done" ] && task_pr_recorded "$id" "$state"; then
+      src=${line#*source: }; src=${src%% *}
+      outcome=$(terminal_outcome "$line")
+      if [ "$crew_state" = "done" ] && [ "$src" = run-step ] \
+        && [ "$outcome" = checks-passed ] && task_pr_recorded "$id" "$state"; then
         printf 'awaiting-merge'; return
+      fi
+      if [ "$crew_state" = "done" ] && [ "$src" = run-step ] && [ "$outcome" = passed ]; then
+        printf 'none'; return
       fi
       if status_is_paused "$(last_status_line "$state/$id.status")"; then
         printf 'paused'; return

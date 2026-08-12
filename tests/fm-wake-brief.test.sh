@@ -141,8 +141,19 @@ LINE=$(brief "$(rec check "$STATE/merged-h9.check.sh" 'check: /x/merged-h9.check
 case "$LINE" in *"fm-teardown.sh merged-h9"*) ;; *) fail "a fired merge poll must brief teardown: $LINE" ;; esac
 # The same word in a non-check payload must not hijack the line.
 LINE=$(brief "$(rec signal merged-h9.status 'signal: merged something')")
-case "$LINE" in *"fm-teardown.sh"*) fail "a non-check payload hijacked the merge branch: $LINE" ;; esac
-pass "a fired merge poll briefs teardown, and only a check wake can take that branch"
+case "$LINE" in *"fm-pr-merge.sh"*) fail "a merged-or-closed run was briefed with a merge command: $LINE" ;; esac
+case "$LINE" in *"fm-teardown.sh merged-h9"*) ;; *) fail "a merged-or-closed run did not brief teardown: $LINE" ;; esac
+pass "a fired merge poll and a merged-or-closed run both brief teardown without a merge command"
+
+reset_state
+fm_write_meta "$STATE/coarse-j10.meta" "window=test:fm-coarse-j10" "kind=ship" \
+  "pr=https://example.test/o/r/pull/10"
+printf 'done: PR https://example.test/o/r/pull/10 checks green\n' > "$STATE/coarse-j10.status"
+FM_FAKE_CREW_STATE='state: done · source: run-step · run completed'
+LINE=$(brief "$(rec signal coarse-j10.status 'signal: completed')")
+case "$LINE" in *"fm-pr-merge.sh"*) fail "an ambiguous completed run was briefed with a merge command: $LINE" ;; esac
+case "$LINE" in *"terminal outcome is ambiguous"*) ;; *) fail "an ambiguous completed run did not ask for a deeper state read: $LINE" ;; esac
+pass "an ambiguous completed run never asserts a merge"
 
 reset_state
 LINE=$(brief "$(rec heartbeat heartbeat heartbeat)")
@@ -168,6 +179,21 @@ OUT=$(printf '%s\n%s\n' "$(rec signal batch-f6.status)" "$(rec signal batch-f6.t
 [ "$(printf '%s\n' "$OUT" | grep -c .)" = 2 ] || fail "a two-record batch must brief two lines: $OUT"
 [ "$(grep -c . "$COUNTER")" = 1 ] || fail "the same task must cost ONE crew-state read per batch, got $(grep -c . "$COUNTER")"
 pass "a coalesced batch naming one task twice costs a single crew-state read"
+
+# The default brief must render every drained record; the optional cap remains an
+# explicit operator escape hatch rather than a silent default loss of wake detail.
+reset_state
+RECORDS="$TMP_ROOT/many-wakes.records"
+: > "$RECORDS"
+i=1
+while [ "$i" -le 51 ]; do
+  printf '%s\n' "$(rec heartbeat "heartbeat-$i")" >> "$RECORDS"
+  i=$((i + 1))
+done
+OUT=$(FM_STATE_OVERRIDE="$STATE" "$BRIEF" "$RECORDS")
+[ "$(printf '%s\n' "$OUT" | grep -c '^heartbeat')" = 51 ] \
+  || fail "the default wake brief dropped records: $(printf '%s\n' "$OUT" | grep -c '^heartbeat')"
+pass "the default wake brief renders every drained record"
 
 # --- drain wiring: records unchanged, brief appended, opt-out honored ---------
 

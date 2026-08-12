@@ -32,7 +32,7 @@
 #   FM_WAKE_BRIEF_CREW_STATE=0  skip the bin/fm-crew-state.sh read and report
 #                               state from the status log alone (cheaper, less
 #                               accurate; the log is an event log, not a state).
-#   FM_WAKE_BRIEF_MAX=<n>       cap the rendered records (default 50).
+#   FM_WAKE_BRIEF_MAX=<n>       optional rendered-record cap; 0 (the default) is unlimited.
 # Always exits 0: a brief is an aid to handling wakes and must never fail a drain.
 set -u
 
@@ -46,8 +46,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$SCRIPT_DIR/fm-crew-state.sh}"
 READ_CREW_STATE=${FM_WAKE_BRIEF_CREW_STATE:-1}
-MAX=${FM_WAKE_BRIEF_MAX:-50}
-case "$MAX" in ''|*[!0-9]*) MAX=50 ;; esac
+MAX=${FM_WAKE_BRIEF_MAX:-0}
+case "$MAX" in ''|*[!0-9]*) MAX=0 ;; esac
 SEP=' · '
 
 case "${1:-}" in
@@ -169,8 +169,8 @@ EOF
 # The deterministic state -> single-next-action table. Every branch names one
 # command or one relay, or says plainly that it cannot tell and points at the
 # deeper tool; it never guesses.
-next_action() {  # <task> <state> <payload> <open-decisions> <wake-kind>
-  local task=$1 state=$2 payload=$3 open=$4 wake=$5 pr kind mode harness window count
+next_action() {  # <task> <state> <payload> <open-decisions> <wake-kind> <crew-state>
+  local task=$1 state=$2 payload=$3 open=$4 wake=$5 cs=${6:-} pr kind mode harness window count outcome
   window=$(meta_field "$task" window)
   [ -n "$window" ] || window=$(meta_field "$task" terminal)
 
@@ -243,7 +243,18 @@ next_action() {  # <task> <state> <payload> <open-decisions> <wake-kind>
       if [ "$kind" = scout ]; then
         printf 'read data/%s/report.md, relay the findings, then bin/fm-teardown.sh %s' "$task" "$task"
       elif [ -n "$pr" ]; then
-        printf 'PR %s is recorded and the merge poll is armed - relay it, then bin/fm-pr-merge.sh %s %s once approved' "$pr" "$task" "$pr"
+        outcome=$(terminal_outcome "$cs")
+        case "$outcome" in
+          passed)
+            printf 'the run passed and the PR is merged or closed - bin/fm-teardown.sh %s and close the backlog item' "$task"
+            ;;
+          checks-passed)
+            printf 'PR %s is recorded and the merge poll is armed - relay it, then bin/fm-pr-merge.sh %s %s once approved' "$pr" "$task" "$pr"
+            ;;
+          *)
+            printf 'PR %s is recorded but the terminal outcome is ambiguous - read bin/fm-crew-state.sh %s before choosing merge or teardown' "$pr" "$task"
+            ;;
+        esac
       elif [ "$mode" = local-only ]; then
         printf 'review with bin/fm-review-diff.sh %s, relay the summary, then bin/fm-merge-local.sh %s once approved' "$task" "$task"
       elif [ "$mode" = direct-PR ]; then
@@ -283,7 +294,7 @@ render_record() {  # <kind> <key> <payload>
     "$kind" "$task" "$SEP" \
     "$(state_render "$cs" "$last")" "$SEP" \
     "${last:--}" "$SEP" \
-    "$(next_action "$task" "$state" "$payload" "$open" "$kind")"
+    "$(next_action "$task" "$state" "$payload" "$open" "$kind" "$cs")"
 }
 
 SRC=${1:-}
@@ -292,7 +303,7 @@ while IFS=$(printf '\t') read -r _epoch _seq kind key payload; do
   [ -n "${kind:-}" ] || continue
   case "$kind" in signal|stale|check|heartbeat) ;; *) continue ;; esac
   n=$((n + 1))
-  if [ "$n" -gt "$MAX" ]; then
+  if [ "$MAX" -gt 0 ] && [ "$n" -gt "$MAX" ]; then
     printf '... further wake record(s) beyond the first %s are not briefed (FM_WAKE_BRIEF_MAX); read them from the records above\n' \
       "$MAX"
     break
