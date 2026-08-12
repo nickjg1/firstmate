@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Atomically drain durable watcher wake records, then assert watcher liveness.
 #
-# Output is two blocks. First the durable records themselves, unchanged - they
+# By default, output is two blocks. First the durable records themselves, unchanged - they
 # are the lossless log and every existing consumer keeps reading them. Then a
 # WAKE BRIEF: one compact actionable line per record (bin/fm-wake-brief.sh),
 # folding in the reads a supervisor otherwise makes by hand for every single

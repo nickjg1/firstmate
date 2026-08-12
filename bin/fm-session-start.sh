@@ -70,7 +70,7 @@
 # below are always read-only, so they run unconditionally in both modes.
 #
 # Usage: fm-session-start.sh
-#   Prints the full ordered digest to stdout and always exits 0: this is a
+#   Prints the ordered digest to stdout and always exits 0: this is a
 #   reporting command, not a gate. A lock refusal is reported as a loud
 #   banner inline, never a silent failure or a non-zero exit that would make
 #   an agent skip the rest of the digest.

@@ -9,10 +9,10 @@ firstmate's full operating manual for the orchestrator agent itself is [`AGENTS.
 ## Event-driven supervision
 
 A zero-token bash watcher (`bin/fm-watch.sh`) sleeps on the fleet, classifies detected wakes in bash, and wakes the first mate only when something is actionable.
-Actionable wakes include captain-relevant status signals, no-verb signals whose crew is not provably working, check-script output such as PR merge polling or an X-mode mention, stale panes whose crew is not provably working whether their status log looks terminal or non-terminal, provably-working stale panes that persist past `FM_STALE_ESCALATE_SECS`, declared external waits that remain paused past `FM_PAUSE_RESURFACE_SECS`, and heartbeat backstop hits.
+Actionable wakes include captain-relevant status signals, no-verb signals whose crew is not provably working, check-script output such as PR merge polling or an X-mode mention, stale panes whose crew is not provably working whether their status log looks terminal or non-terminal, provably-working stale panes that persist past `FM_STALE_ESCALATE_SECS`, declared external waits that remain paused past `FM_PAUSE_RESURFACE_SECS`, recorded green PRs that remain unmerged past `FM_AWAITING_MERGE_RESURFACE_SECS`, and heartbeat backstop hits.
 Repeated provably-working stale escalations on the same unchanged pane add an escalation count to the wake reason and, at `FM_WEDGE_DEMAND_INSPECT_COUNT`, a `demand-deep-inspection` marker.
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
-No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crew is still working: an actively running no-mistakes step for that crew's branch or a backend busy signature.
+No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign when `bin/fm-crew-state.sh` reports positive evidence that the crew is still working, or when the shared classifier recognizes one of the explicitly safe expected-idle classes: a declared pause or a recorded green PR awaiting merge.
 A crew that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
@@ -36,8 +36,8 @@ A different status line, a first sighting, or a repeat past that window still es
 No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 After each drain, `fm-wake-drain.sh` runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
-The drain also prints a wake brief below the durable records (`bin/fm-wake-brief.sh`): one compact line per wake carrying the task, its current state, its last status line, and a deterministic next action.
-Those are exactly the follow-up reads a supervisor otherwise repeats by hand for every wake - the status file, the meta, and the crew's current state - so doing them once in bash is what makes handling a wake cost one read instead of several LLM turns.
+By default, the drain also prints a wake brief below the durable records (`bin/fm-wake-brief.sh`): one compact line per wake carrying the task, its current state, its last status line, and a deterministic next action.
+In its default mode, those are exactly the follow-up reads a supervisor otherwise repeats by hand for every wake - the status file, the meta, and the crew's current state - so doing them once in bash is what makes handling a wake cost one read instead of several LLM turns.
 The deeper tools stay authoritative and unchanged; a brief line names them whenever it cannot resolve the state itself.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.

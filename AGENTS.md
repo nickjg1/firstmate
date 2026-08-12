@@ -105,7 +105,7 @@ state/               volatile runtime signals; gitignored
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
-  .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
+  .hash-* .count-* .stale-* .stale-since-* .paused-* .awaiting-merge-* .merge-resurfaced-* .wedge-escalations-* .wedge-acked-* .push-escalated-* .idle-since-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
@@ -121,7 +121,7 @@ For the tmux backend, the task window is always named `fm-<id>`; per-backend win
 
 Session start is one command, not a sequence of separate reads.
 Run `bin/fm-session-start.sh`.
-It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - calling each as a real subprocess, never reimplementing their logic - then prints a full context digest and fleet-state digest, in one ordered, clearly delimited report:
+It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - calling each as a real subprocess, never reimplementing their logic - then prints a compact context digest and fleet-state digest, in one ordered, clearly delimited report:
 
 1. **Lock** - acquires the per-home session lock first, before anything mutates shared state.
 2. **Bootstrap** - detect-only diagnostics (tool/version problems, GitHub auth, the worktree-tangle check, harness override, dispatch-profile validation, backlog-backend status) always run and always print.
@@ -554,9 +554,9 @@ The watcher is the backbone.
 Whenever at least one task is in flight, keep exactly one live supervision wait owned by the emitted primary-harness protocol from `bin/fm-session-start.sh`.
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
-**Always-on wake triage (absorb only when provably working).**
+**Always-on wake triage (classify before absorbing).**
 `bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane, read via `bin/fm-crew-state.sh`), a declared `paused:` external wait until its bounded recheck cadence, a crew parked on a PR you already recorded with `bin/fm-pr-check.sh` until its own bounded recheck, and no-change heartbeats.
-It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
+It never absorbs a stopped crewmate without either positive working evidence or one of those explicitly safe expected-idle classifications - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
 The same holds for a PR awaiting merge: the crew's own `done: PR ... checks green` signal still surfaces once, after which the armed merge poll is the wake path and the idle pane is not - so never hand-append a status line to quiet such a pane.
 Repeated provably-working stale escalations on one unchanged pane eventually add `demand-deep-inspection` to the wake reason so it is not mistaken for another routine validation wait.
@@ -564,7 +564,7 @@ Repeated provably-working stale escalations on one unchanged pane eventually add
 At the start of every wake-handling turn, run `bin/fm-wake-drain.sh` before peeking panes, reading status files beyond the reason line, or starting new work.
 Session-start recovery is the exception: `bin/fm-session-start.sh` already drained the queue when locked, or deliberately skipped the drain when read-only because another session owns it.
 The printed reason line is still useful, but the drained queue is the lossless backlog.
-The drain prints a **wake brief** under the records: one compact line per wake giving the task, its current state, its last status line, and the single next action.
+By default, the drain prints a **wake brief** under the records: one compact line per wake giving the task, its current state, its last status line, and the single next action.
 That brief is the default path - act from it, and reach for `bin/fm-crew-state.sh`, `bin/fm-peek.sh`, or `bin/fm-fleet-view.sh` only when a brief line says to or when it reports the state unreadable.
 **Keep exactly one live cycle.**
 The live cycle is the supervision: while any task is in flight, the active harness protocol must maintain one wait that can wake this primary when `bin/fm-watch.sh` reports an actionable reason.
@@ -587,20 +587,21 @@ bin/fm-watch-arm.sh                 # verified arm wrapper used by harness proto
 bin/fm-watch-arm.sh --restart       # home-scoped forced restart; never a broad pkill
 bin/fm-watch-checkpoint.sh          # bounded foreground watcher checkpoint for Codex-style protocols
 bin/fm-watch.sh                     # the watcher itself; exits with: signal|stale|check|heartbeat
-bin/fm-wake-drain.sh                # drain queued wake records at turn start; prints the wake brief; asserts guard after draining
+bin/fm-wake-drain.sh                # drain queued wake records at turn start; prints the wake brief by default; asserts guard after draining
 bin/fm-crew-state.sh <id>           # one-line current-state read; reconciles matching run-step, pane, and status log
 bin/fm-fleet-view.sh                # read-only Markdown whole-fleet view rendered from the structured snapshot
 ```
 
-On wake, in order of cheapness:
+On wake, use the drain's brief as the cheapness-ordered default:
 
 1. Read the reason line and drain queued wake records with `bin/fm-wake-drain.sh`.
-2. `signal:` read the listed status files first; a wake lists every signal that landed within the coalescing grace window (e.g. a status write plus the same turn's turn-end marker), and each is ~30 tokens and usually sufficient.
+2. Act from the corresponding brief line first; it already carries the task, current state, last status EVENT, and one next action.
+   For `signal:`, do not separately read the listed status files unless the brief points there or older wake-event history is needed.
    A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the authoritative run-step over the possibly-stale log line, and never `tail` the status log as the current-state source.
-3. `stale:` the crewmate stopped without reporting; peek the pane (`bin/fm-peek.sh <window>`) to diagnose.
+3. For `stale:`, follow the brief's next action; peek the pane (`bin/fm-peek.sh <window>`) only when it asks for diagnosis.
    If the stale reason includes `demand-deep-inspection`, inspect the pane, `bin/fm-crew-state.sh <id>`, and the validation logs before resuming supervision.
    If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
-4. `check:` a per-task poll fired (usually a merge, or X mode when enabled); act on it.
+4. For `check:`, follow the brief's next action for the per-task poll that fired, usually a merge or X-mode poll.
 5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol.
    Do not report that the fleet is unchanged.
 
@@ -754,7 +755,7 @@ Keep the charter focused on persistent responsibility, available project clones,
 Preserve the requests-from-main-firstmate contract in the charter: marked requests return via status or a doc pointer, while unmarked direct captain messages stay conversational.
 Before seeding, launching, recovering, or handing backlog to a secondmate home, load `secondmate-provisioning`.
 The status-reporting protocol is intentionally sparse: crewmates append status only for supervisor-actionable phase changes, `needs-decision`/`blocked`/`paused`/`done`/`failed`, or the `resolved` line that closes a previously reported decision or blocker, because every append wakes firstmate.
-For the same reason the scaffold makes crewmates batch every pending question into one `needs-decision` rather than serializing them; `bin/fm-brief.sh` owns that decision-cost contract in full.
+The generated brief's full decision-cost and standing-authorization contract is owned by `bin/fm-brief.sh`.
 `bin/fm-classify-lib.sh` owns the keyed open/resolved status contract.
 For any generated brief that still contains `{TASK}`, replace it with a clear task description, acceptance criteria, and any constraints or context the crewmate needs before spawning or seeding.
 Adjust the other sections only when the task genuinely deviates from the standard ship-a-new-PR shape (e.g. fixing an existing external PR); the scaffold is the contract, not a suggestion.
