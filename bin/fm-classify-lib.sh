@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared wake classifier: the common source of truth for captain-relevant status
-# tests, declared-external-wait vocabulary, and the working/paused absorb
-# classification that makes no-verb signal and stale-pane wakes safe to absorb.
+# tests, declared-external-wait vocabulary, and the working/paused/awaiting-merge
+# absorb classification that makes no-verb signal and stale-pane wakes safe to absorb.
 # Sourced by BOTH the always-on watcher
 # (bin/fm-watch.sh) and the away-mode daemon (bin/fm-supervise-daemon.sh) so the
 # overlapping triage policy lives in one place instead of two copies that can
@@ -14,12 +14,14 @@
 # signatures).
 #
 # The one exception is the absorb classification (crew_absorb_class and its
-# working/paused wrappers). It is NOT a pure status-file read: it reuses
-# bin/fm-crew-state.sh, which may make a bounded no-mistakes call, to decide
-# whether a crew that just stopped its turn or went stale is working, deliberately
-# paused, or neither. Callers run it ONLY on no-verb signal handling and first
-# sighting of a stale hash, never on every wake, so the per-wake triage stays
-# cheap.
+# wrappers). It is NOT a pure status-file read: it reuses bin/fm-crew-state.sh,
+# which may make a bounded no-mistakes call, to decide whether a crew that just
+# stopped its turn or went stale is working, deliberately paused, parked on a PR
+# awaiting merge, or none of those. It also reads the task's own state/<id>.meta
+# and status file, so it takes the state dir as an optional second argument,
+# defaulting to the caller's STATE. Callers run it ONLY on no-verb signal handling
+# and first sighting of a stale hash, never on every wake, so the per-wake triage
+# stays cheap.
 
 # Directory of this library, used to locate the sibling fm-crew-state.sh reader.
 # Resolved at source time from BASH_SOURCE so it works whether sourced by a
@@ -58,6 +60,14 @@ FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 # read FM_PAUSE_RESURFACE_SECS with this default so the cadence has one owner.
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
+
+# Bounded re-surface cadence for a crew parked on a recorded PR awaiting merge
+# (the awaiting-merge absorb class below). Same shape and default as the pause
+# cadence and read by the same consumers, but kept a distinct knob so an
+# operator can tune "how often do I want reminding about an unmerged PR"
+# independently of "how often do I recheck a declared external wait".
+# shellcheck disable=SC2034 # Read by the watcher (fm-watch.sh), not this lib.
+FM_AWAITING_MERGE_RESURFACE_SECS_DEFAULT=3600
 
 # The resolution verb that CLOSES a keyed decision opened by needs-decision or
 # blocked. See status_open_decisions below for the full durable-decision contract;
@@ -121,6 +131,38 @@ status_line_verb() {  # <status-line> -> leading verb word
   v=${v%"${v##*[![:space:]]}"}
   printf '%s' "$v"
 }
+# THE status-verb -> canonical-state mapping. Lives here rather than in one
+# consumer because several readers need it: bin/fm-crew-state.sh's no-run
+# fallback, and bin/fm-wake-brief.sh when a crew-state read is unavailable. A
+# verb with no run-state meaning (notably the decision-closing `resolved`) maps
+# to `unknown`, which is what lets callers use this verdict as their "not a
+# state" test instead of keeping a second verb list.
+map_log_state() {  # <status-line> -> working|parked|blocked|paused|done|failed|unknown
+  # The VERB is configurable (FM_CLASSIFY_PAUSED_VERB); the canonical STATE it
+  # maps to is always `paused`, so a home with a custom verb still reports a
+  # state name every consumer recognizes.
+  if status_is_paused "$1"; then
+    printf 'paused'
+    return
+  fi
+  case "$(status_line_verb "$1")" in
+    working)        printf 'working' ;;
+    needs-decision) printf 'parked' ;;
+    blocked)        printf 'blocked' ;;
+    done)           printf 'done' ;;
+    failed)         printf 'failed' ;;
+    *)              printf 'unknown' ;;
+  esac
+}
+
+terminal_outcome() {  # <state/detail line> -> checks-passed|passed|unknown
+  case "$1" in
+    *"checks green: PR ready for review"*) printf 'checks-passed' ;;
+    *"run passed: PR merged/closed"*) printf 'passed' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 status_line_note() {  # <status-line> -> text after the first colon, trimmed
   case "$1" in
     *:*) local n=${1#*:}; printf '%s' "${n#"${n%%[![:space:]]*}"}" ;;
@@ -224,33 +266,80 @@ signal_reason_is_actionable() {  # <file> ...
   return 1
 }
 
+# 0 when <state>/<id>.meta records a non-empty pr= and the per-task merge poll
+# exists at state/<id>.check.sh. Both are required because the poll shim is the
+# durable wake path that makes the awaiting-merge absorb below safe: the news is
+# already delivered and a real wake path for the merge already exists, so
+# repeating the crew's idle pane as a stale wake adds nothing.
+task_pr_recorded() {  # <id> <state>
+  local id=$1 state=$2 pr
+  [ -n "$id" ] && [ -n "$state" ] || return 1
+  [ -f "$state/$id.meta" ] || return 1
+  pr=$(grep '^pr=' "$state/$id.meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  [ -n "$pr" ] || return 1
+  [ -f "$state/$id.check.sh" ]
+}
+
 # Classify WHY an idle/stale crew MIGHT be safely absorbed instead of surfaced,
 # from bin/fm-crew-state.sh's one authoritative current-state line
 # ("state: <s> · source: <src> · <detail>"). Prints exactly one token:
-#   working - an actively-running no-mistakes step (running/fixing/ci) or a busy
-#             pane; the crew is legitimately mid-work on a static-looking pane
-#             (e.g. waiting on CI);
-#   paused  - the crew's authoritative current state is a declared external-wait
-#             pause (paused:), which is EXPECTED to idle;
-#   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
-#             torn-down/unknown crew, or an unreadable verdict).
-# One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
-# authoritatively (not the status log) is what keeps run-step precedence: a crew
-# that appended paused: but then STARTED a run reports working, never paused.
+#   working        - an actively-running no-mistakes step (running/fixing/ci) or a
+#                    busy pane; the crew is legitimately mid-work on a
+#                    static-looking pane (e.g. waiting on CI);
+#   awaiting-merge - the run reached a TERMINAL checks-passed outcome and the
+#                    task meta records a pr=, so the crew is parked on a green
+#                    PR firstmate already knows about;
+#   paused         - the crew's authoritative current state is a declared
+#                    external-wait pause (paused:), which is EXPECTED to idle, OR
+#                    the run is terminal and the status log declares a pause (see
+#                    the run-step precedence note below);
+#   none           - none of the above, so the wake must surface (a stopped/
+#                    parked/failed/torn-down/unknown crew, or an unreadable
+#                    verdict).
+# One fm-crew-state.sh read serves EVERY absorb reason at once.
+#
+# Run-step precedence, and its exact limit: reading the state authoritatively
+# (not the status log) is what stops a stale `paused:` line from masking a crew
+# that appended the pause and then STARTED a run - that crew reports working,
+# never paused. That precedence is about an ACTIVE run, and it is deliberately
+# not extended to a TERMINAL one: a run that has passed, failed, or been
+# cancelled cannot resume, so it is not evidence about what the crew is doing
+# now, and letting it outrank a declared pause is what made a cancelled run
+# defeat pause absorption entirely (backlog fm-pause-vs-cancelled-run-c2, first
+# variant). Hence the terminal branch below consults the status log; the working
+# branch still never does.
+#
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
 # run it only on no-verb signal and first-sighting stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
-crew_absorb_class() {  # <id>
-  local id=$1 line state src
+crew_absorb_class() {  # <id> [<state>]
+  local id=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} line crew_state src outcome
   [ -n "$id" ] || { printf 'none'; return; }
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
-  state=${line#state: }; state=${state%% *}
-  if [ "$state" = paused ]; then printf 'paused'; return; fi
-  if [ "$state" = working ]; then
+  crew_state=${line#state: }; crew_state=${crew_state%% *}
+  if [ "$crew_state" = paused ]; then printf 'paused'; return; fi
+  if [ "$crew_state" = working ]; then
     src=${line#*source: }; src=${src%% *}
     case "$src" in run-step|pane) printf 'working'; return ;; esac
+    printf 'none'; return
   fi
+  case "$crew_state" in
+    done|failed)
+      src=${line#*source: }; src=${src%% *}
+      outcome=$(terminal_outcome "$line")
+      if [ "$crew_state" = "done" ] && [ "$src" = run-step ] \
+        && [ "$outcome" = checks-passed ] && task_pr_recorded "$id" "$state"; then
+        printf 'awaiting-merge'; return
+      fi
+      if [ "$crew_state" = "done" ] && [ "$src" = run-step ] && [ "$outcome" = passed ]; then
+        printf 'none'; return
+      fi
+      if status_is_paused "$(last_status_line "$state/$id.status")"; then
+        printf 'paused'; return
+      fi
+      ;;
+  esac
   printf 'none'
 }
 
@@ -261,15 +350,25 @@ crew_absorb_class() {  # <id>
 # on a decision, or wedged). For stale panes it is checked before trusting the
 # status log so a pre-validation captain-relevant line does not override an active
 # run. See crew_absorb_class for the exact working/paused/none decision.
-crew_is_provably_working() {  # <id>
-  [ "$(crew_absorb_class "$1")" = working ]
+crew_is_provably_working() {  # <id> [<state>]
+  [ "$(crew_absorb_class "$@")" = working ]
 }
 
 # 0 if crew <id>'s authoritative current state is a declared external-wait pause.
 # The stale path absorbs such a crew (on a long re-surface cadence) instead of
 # escalating a possible wedge.
-crew_is_paused() {  # <id>
-  [ "$(crew_absorb_class "$1")" = paused ]
+crew_is_paused() {  # <id> [<state>]
+  [ "$(crew_absorb_class "$@")" = paused ]
+}
+
+# 0 if crew <id> is parked on a recorded PR awaiting merge. The stale path
+# absorbs such a crew on its own long re-surface cadence: the PR was already
+# relayed and the merge poll is armed, so its idle pane is not news. Before this
+# class existed, a green-PR crew tripped a stale wake every poll until teardown
+# (backlog fm-pause-vs-cancelled-run-c2, third variant; data/learnings.md
+# 2026-07-22), which is the single largest source of spurious supervision wakes.
+crew_is_awaiting_merge() {  # <id> [<state>]
+  [ "$(crew_absorb_class "$@")" = awaiting-merge ]
 }
 
 # 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably

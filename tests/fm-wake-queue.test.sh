@@ -14,6 +14,13 @@ set -u
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
+# This suite asserts on the durable RECORD stream itself - exact record counts
+# and the five-field shape - so it opts out of the human-facing wake brief the
+# drain otherwise appends. That opt-out is the documented contract for any
+# programmatic consumer that parses records; the brief has its own suite in
+# tests/fm-wake-brief.test.sh, which asserts the records stay unchanged beneath it.
+export FM_WAKE_BRIEF=0
+
 TMP_ROOT=$(fm_test_tmproot fm-wake-tests)
 
 

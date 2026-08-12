@@ -83,6 +83,51 @@ test_no_mistakes_dod_wording() {
   pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
 }
 
+# The decision-cost contract. Every needs-decision costs the supervisor a full
+# turn - a measurable share of orchestrator spend - so the scaffold must make
+# crews batch their questions rather than serialize them, and must state the
+# standing authorization that keeps pipeline-auto-fixable findings out of the
+# escalation path entirely. Both belong in the scaffold, which is their one
+# owner; AGENTS.md only cross-references them.
+test_decision_cost_contract() {
+  local home brief
+  home="$TMP_ROOT/decision-cost-home"
+  write_registry "$home"
+
+  for id_proj in "brief-cost-d1:no-registry-proj" "brief-cost-d2:direct-proj" "brief-cost-d3:local-proj"; do
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "${id_proj%%:*}" "${id_proj##*:}" >/dev/null 2>&1
+    brief="$home/data/${id_proj%%:*}/brief.md"
+    assert_present "$brief" "${id_proj%%:*}: brief was not scaffolded"
+    assert_grep "Batch your questions" "$brief" \
+      "${id_proj%%:*}: ship brief lost the decision-batching rule"
+    assert_grep "numbered \`needs-decision\` line" "$brief" \
+      "${id_proj%%:*}: ship brief lost the one-line batching instruction"
+    assert_grep "Never serialize one question per append" "$brief" \
+      "${id_proj%%:*}: ship brief lost the do-not-serialize instruction"
+  done
+
+  # Scouts escalate through the same rule 6, so they carry it too.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cost-d4 some-proj --scout >/dev/null 2>&1
+  assert_grep "Batch your questions" "$home/data/brief-cost-d4/brief.md" \
+    "scout brief lost the decision-batching rule"
+
+  # Secondmates relay to the main firstmate, which pays the same per-escalation cost.
+  FM_SECONDMATE_CHARTER="triage" FM_HOME="$home" \
+    "$ROOT/bin/fm-brief.sh" brief-cost-d5 --secondmate some-proj >/dev/null 2>&1
+  assert_grep "Batch decisions" "$home/data/brief-cost-d5/brief.md" \
+    "secondmate charter lost the decision-batching rule"
+
+  # Standing authorization is no-mistakes-specific: it names the pipeline's own
+  # auto-fix severity, so it belongs only in that mode's definition of done.
+  assert_grep "Standing authorization" "$home/data/brief-cost-d1/brief.md" \
+    "no-mistakes brief lost the standing-authorization rule"
+  assert_grep "never turn one into a \`needs-decision\`" "$home/data/brief-cost-d1/brief.md" \
+    "standing authorization lost its do-not-escalate instruction"
+  assert_no_grep "Standing authorization" "$home/data/brief-cost-d2/brief.md" \
+    "direct-PR brief must not claim a pipeline standing authorization it never runs"
+  pass "fm-brief.sh: every scaffold carries the decision-batching rule, and no-mistakes ships standing authorization"
+}
+
 test_ship_project_memory_wording() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
@@ -264,6 +309,7 @@ test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
+test_decision_cost_contract
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path

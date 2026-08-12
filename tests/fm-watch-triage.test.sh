@@ -223,6 +223,75 @@ test_crew_absorb_class_classifier() {
   pass "crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree"
 }
 
+# The two classifier gaps behind backlog fm-pause-vs-cancelled-run-c2, as pure
+# predicates. Both stem from run-step precedence being applied past the point it
+# is evidence: a TERMINAL run cannot resume, so it says nothing about what the
+# crew is doing now.
+#   - awaiting-merge: a done run plus a recorded pr= and an armed merge poll is a
+#     green PR firstmate already relayed and has a wake path for, so its idle pane
+#     is not news. Without this the crew tripped a stale wake EVERY poll until teardown.
+#   - terminal run + declared pause: a cancelled/failed run used to outrank the
+#     pause and return none, which defeated pause absorption entirely.
+test_crew_absorb_class_terminal_run_classifier() {
+  local dir fakebin state
+  dir=$(make_case absorb-class-terminal); fakebin="$dir/fakebin"; state="$dir/state"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE
+
+  fm_write_meta "$state/merged.meta" "window=test:fm-merged" "kind=ship" "pr=https://example.test/owner/repo/pull/7"
+  fm_write_meta "$state/nopr.meta" "window=test:fm-nopr" "kind=ship"
+  printf 'done: PR https://example.test/owner/repo/pull/7 checks green\n' > "$state/merged.status"
+  printf 'done: PR https://example.test/owner/repo/pull/9 checks green\n' > "$state/nopr.status"
+
+  FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
+  [ "$(crew_absorb_class merged "$state")" = none ] \
+    || fail "a done run with pr= but no poll shim was classed awaiting-merge"
+  : > "$state/merged.check.sh"
+  [ "$(crew_absorb_class merged "$state")" = awaiting-merge ] \
+    || fail "a done run with a recorded pr= and poll shim was not classed awaiting-merge"
+  crew_is_awaiting_merge merged "$state" || fail "crew_is_awaiting_merge did not recognize the verdict"
+  ! crew_is_provably_working merged "$state" || fail "an awaiting-merge crew must not count as provably working"
+  [ "$(crew_absorb_class nopr "$state")" = none ] \
+    || fail "a done run with NO recorded pr= must still surface (firstmate has not been told yet)"
+
+  fm_write_meta "$state/passed.meta" "window=test:fm-passed" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/8"
+  printf 'done: PR https://example.test/owner/repo/pull/8 checks green\n' > "$state/passed.status"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · run passed: PR merged/closed'
+  [ "$(crew_absorb_class passed "$state")" = none ] \
+    || fail "a passed/merged-or-closed run was classed awaiting-merge"
+  ! crew_is_awaiting_merge passed "$state" \
+    || fail "a passed/merged-or-closed run entered the awaiting-merge class"
+
+  fm_write_meta "$state/coarse.meta" "window=test:fm-coarse" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/10"
+  printf 'done: PR https://example.test/owner/repo/pull/10 checks green\n' > "$state/coarse.status"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · run completed'
+  [ "$(crew_absorb_class coarse "$state")" = none ] \
+    || fail "an ambiguous completed run was classed awaiting-merge"
+
+  # A pause declared while the run is terminal is honoured (original c2 report).
+  fm_write_meta "$state/cancelled.meta" "window=test:fm-cancelled" "kind=ship"
+  printf 'working: fixing\npaused: awaiting the upstream release\n' > "$state/cancelled.status"
+  FM_FAKE_CREW_STATE='state: failed · source: run-step · run cancelled'
+  [ "$(crew_absorb_class cancelled "$state")" = paused ] \
+    || fail "a declared pause behind a CANCELLED run was not honoured"
+  # ... but a failed run with no pause still surfaces: that needs the captain.
+  printf 'working: fixing\n' > "$state/cancelled.status"
+  [ "$(crew_absorb_class cancelled "$state")" = none ] \
+    || fail "a failed run with no declared pause must still surface"
+
+  # Run-step precedence for an ACTIVE run is untouched: a stale pause behind a
+  # running pipeline still reports working, never paused.
+  printf 'paused: awaiting the upstream release\n' > "$state/cancelled.status"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  [ "$(crew_absorb_class cancelled "$state")" = working ] \
+    || fail "run-step precedence for an ACTIVE run was weakened by the terminal-run branch"
+
+  unset FM_FAKE_CREW_STATE
+  pass "crew_absorb_class: only checks-passed is awaiting-merge; passed or ambiguous terminal runs surface"
+}
+
 # signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY
 # task it references is provably working; if any crew has stopped, or no task can be
 # resolved, it surfaces. Files map to ids by stripping .status / .turn-ended.
@@ -588,6 +657,250 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the paused re-surface failed"
   grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "paused re-surface was not queued"
   pass "a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated"
+}
+
+# --- stale pane, crew parked on a recorded PR awaiting merge: absorbed --------
+# Regression for the highest-volume spurious wake the fleet has produced
+# (data/learnings.md 2026-07-22; backlog fm-pause-vs-cancelled-run-c2, third
+# variant). A crew whose run is terminal at checks-passed with a green PR
+# awaiting the captain's merge tripped a `stale:` wake every ~30-60s for HOURS -
+# each one a full supervisor turn - because a paused: last line is not
+# captain-relevant, so the non-terminal path called crew_absorb_class, got `none`
+# from the authoritative (done) run-step, and re-fired surface_nonterminal_stale
+# on EVERY poll even though the pane hash never changed. Absorbing is safe rather
+# than merely quiet: the pr= in meta exists only because firstmate ran
+# fm-pr-check.sh, which both proves the PR was relayed and armed the merge poll.
+# The helper runs the same assertion for both status-log shapes, because the two
+# shapes take DIFFERENT branches (captain-relevant -> stale_is_terminal;
+# paused -> non-terminal) and the bug had to be fixed in both.
+assert_awaiting_merge_absorbed() {  # <case> <window> <task> <last-status-line>
+  local case_name=$1 window=$2 task=$3 status_line=$4
+  local dir state fakebin out capture_file key pane_hash sig pid back statusf
+  dir=$(make_case "$case_name"); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/$task.status"
+  printf 'PR open, waiting on the captain\n' > "$capture_file"
+  fm_write_meta "$state/$task.meta" "window=$window" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/42"
+  : > "$state/$task.check.sh"
+  printf '%s\n' "$status_line" > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-${task}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "PR open, waiting on the captain")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
+
+  # Phase A: absorbed, and - the actual regression - it STAYS absorbed across
+  # many polls on the same unchanged hash rather than re-firing every cycle.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_AWAITING_MERGE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    reap "$pid"; fail "[$case_name] watcher surfaced a crew parked on a recorded PR awaiting merge: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "[$case_name] an awaiting-merge stale printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "[$case_name] an awaiting-merge stale enqueued a wake"; }
+  [ -e "$state/.awaiting-merge-$key" ] || { reap "$pid"; fail "[$case_name] the awaiting-merge flag was not recorded"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "[$case_name] an awaiting-merge absorb must not start the wedge timer"; }
+  reap "$pid"
+
+  # Phase B: anti-rot. Age the status past the recheck window; it reports once,
+  # labelled as a merge recheck and never as a wedge.
+  back=$(( $(date +%s) - 500 ))
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
+  else touch -m -d "@$back" "$statusf"; fi
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-${task}_status"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_AWAITING_MERGE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "[$case_name] watcher did not recheck an awaiting-merge crew past the cadence"
+  grep -F "stale: $window" "$out" >/dev/null || fail "[$case_name] the merge recheck did not print a stale wake"
+  grep -F "awaiting merge" "$out" >/dev/null || fail "[$case_name] the recheck was not labelled an awaiting-merge recheck"
+  grep -F "possible wedge" "$out" >/dev/null && fail "[$case_name] an awaiting-merge crew was mislabeled a possible wedge"
+  unset FM_FAKE_CREW_STATE
+}
+
+test_awaiting_merge_stale_absorbed_then_rechecked() {
+  # The exact documented failing shape: the crew declared a pause to try to quiet
+  # the thrash, which is precisely what did NOT work before this classifier fix.
+  assert_awaiting_merge_absorbed awaiting-merge-paused-line \
+    "test:fm-green-paused" green-paused "paused: awaiting captain merge decision"
+  # And the shape the interim hand-appended mute produced, which took the other
+  # branch: a captain-relevant last line routed through stale_is_terminal.
+  assert_awaiting_merge_absorbed awaiting-merge-done-line \
+    "test:fm-green-done" green-done "done: PR https://example.test/owner/repo/pull/42 checks green"
+  pass "a crew parked on a recorded PR awaiting merge is absorbed on every poll and only rechecked on the long cadence"
+}
+
+test_awaiting_merge_rechecks_unchanged_hash() {
+  local dir state fakebin out capture_file window task key pane_hash sig pid verdict
+  dir=$(make_case awaiting-merge-transition); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-transition"; task=transition
+  verdict="$dir/verdict"
+  printf 'PR open, waiting on the captain\n' > "$capture_file"
+  printf 'checks-passed\n' > "$verdict"
+  cat > "$fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "$(cat "$FM_TEST_VERDICT")" = checks-passed ]; then
+  printf '%s\n' 'state: done · source: run-step · checks green: PR ready for review'
+else
+  printf '%s\n' 'state: done · source: run-step · run passed: PR merged/closed'
+fi
+SH
+  chmod +x "$fakebin/fm-crew-state.sh"
+  printf 'window=%s\nkind=ship\npr=https://example.test/owner/repo/pull/42\n' "$window" > "$state/$task.meta"
+  printf 'done: PR https://example.test/owner/repo/pull/42 checks green\n' > "$state/$task.status"
+  : > "$state/$task.check.sh"
+  sig=$(seen_sig "$state/$task.status"); printf '%s' "$sig" > "$state/.seen-${task}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "PR open, waiting on the captain")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_TEST_VERDICT="$verdict" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=1 FM_AWAITING_MERGE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_numeric_file "$state/.awaiting-merge-rechecked-$key" 30 \
+    || { reap "$pid"; fail "awaiting-merge state was not throttled after initial classification"; }
+  printf 'passed\n' > "$verdict"
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "unchanged awaiting-merge hash never reclassified after the bounded window"; }
+  grep -F "stale: $window" "$out" >/dev/null || fail "state transition did not surface a stale wake: $(cat "$out")"
+  [ ! -e "$state/.awaiting-merge-$key" ] || fail "state transition retained the awaiting-merge marker"
+  [ "$(cat "$state/.hb-surfaced-$task" 2>/dev/null || true)" = "done: PR https://example.test/owner/repo/pull/42 checks green" ] \
+    || fail "state transition did not mark the surfaced status for heartbeat deduplication"
+  pass "an unchanged awaiting-merge hash rechecks current state and surfaces after the bounded window"
+}
+
+test_awaiting_merge_missing_status_rechecks() {
+  local dir state fakebin out capture_file window task key pane_hash pid idle_since back
+  dir=$(make_case awaiting-merge-missing-status); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-missing-status"; task=missing-status
+  printf 'PR open, waiting on the captain\n' > "$capture_file"
+  fm_write_meta "$state/$task.meta" "window=$window" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/42"
+  : > "$state/$task.check.sh"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "PR open, waiting on the captain")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_AWAITING_MERGE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  idle_since="$state/.idle-since-$key"
+  wait_numeric_file "$idle_since" 30 \
+    || { reap "$pid"; fail "missing-status absorb did not create its durable first-seen marker"; }
+  reap "$pid"
+  back=$(( $(date +%s) - 500 ))
+  printf '%s\n' "$back" > "$idle_since"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_AWAITING_MERGE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "missing-status absorb never re-surfaced past its durable first-seen window"; }
+  grep -F "stale: $window" "$out" >/dev/null || fail "missing-status recheck did not surface a stale wake: $(cat "$out")"
+  grep -F "awaiting merge" "$out" >/dev/null || fail "missing-status recheck omitted its awaiting-merge reason"
+  pass "an awaiting-merge absorb with no status mtime still re-surfaces from its durable first-seen marker"
+}
+
+# --- stale pane, TERMINAL (cancelled) run behind a declared pause: absorbed ----
+# The original fm-pause-vs-cancelled-run-c2 report. A formally cancelled run made
+# fm-crew-state report a terminal state, which outranked the crew's fresh
+# `paused:` line and returned `none`, so pause absorption was defeated and stale
+# wakes fired every poll. A terminal run cannot resume, so it is not evidence
+# about what the crew is doing now, and the pause wins.
+test_cancelled_run_declared_pause_absorbed() {
+  local dir state fakebin out capture_file window key pane_hash sig pid statusf
+  dir=$(make_case cancelled-run-paused); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-cancelled"
+  statusf="$state/cancelled.status"
+  printf 'idle after the run was cancelled\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/cancelled.meta"
+  printf 'paused: holding for the upstream fix, run was cancelled\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-cancelled_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle after the run was cancelled")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: failed · source: run-step · run cancelled'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 45; then
+    reap "$pid"; fail "a declared pause behind a cancelled run was surfaced every poll: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "a cancelled-run pause printed a wake reason: $(cat "$out")"; }
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "a cancelled-run pause was not recorded as a declared pause"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "a declared pause must not start the wedge timer"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a declared pause is honoured over a TERMINAL (cancelled) run instead of being defeated by run-step precedence"
+}
+
+# --- a repeatedly-escalated wedge is acknowledged by a declared pause ----------
+# The second fm-pause-vs-cancelled-run-c2 variant. An ACTIVE run keeps a crew
+# classed working even behind a declared pause (correct for the signal path), so
+# a pane whose agent had exited under a still-open run repeated the identical
+# possible-wedge alarm every FM_STALE_ESCALATE_SECS forever, with no way to say
+# "diagnosed, benign". Past the demand-deep-inspection threshold the supervisor
+# has demonstrably both seen the alarm and declared the wait, so it de-escalates
+# to the bounded pause recheck. Escalations below the threshold are untouched -
+# test_paused_authoritative_working_preserves_wedge_timer still asserts those.
+test_wedge_acknowledged_by_declared_pause() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case wedge-acknowledged-by-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-ack-pause"
+  printf 'dead shell, agent exited\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/ack-pause.meta"
+  printf 'paused: agent exited, relaunch deferred by the captain\n' > "$state/ack-pause.status"
+  sig=$(seen_sig "$state/ack-pause.status"); printf '%s' "$sig" > "$state/.seen-ack-pause_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "dead shell, agent exited")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The alarm has already fired the full demand-deep-inspection run, and the
+  # timer is past the threshold again - pre-fix, this fires escalation 4, then 5,
+  # then 6, indefinitely.
+  printf '3\n' > "$state/.wedge-escalations-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 40; then
+    reap "$pid"; fail "an acknowledged wedge kept escalating despite a declared pause: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "an acknowledged wedge printed another escalation: $(cat "$out")"; }
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "the acknowledged wedge did not de-escalate to the pause recheck"; }
+  [ -e "$state/.wedge-acked-$key" ] || { reap "$pid"; fail "the acknowledgement was not recorded durably"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "the acknowledged wedge kept its wedge timer"; }
+  [ ! -e "$state/.wedge-escalations-$key" ] || { reap "$pid"; fail "the acknowledged wedge kept its escalation count"; }
+  grep -F "wedge acknowledged" "$state/.watch-triage.log" >/dev/null \
+    || { reap "$pid"; fail "the acknowledgement was not recorded in the triage log"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "a repeatedly-escalated wedge behind a declared pause de-escalates to the bounded pause recheck"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -1103,6 +1416,7 @@ test_classifier_primitives
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
+test_crew_absorb_class_terminal_run_classifier
 test_signal_crew_provably_working_classifier
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
@@ -1116,6 +1430,11 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
+test_awaiting_merge_stale_absorbed_then_rechecked
+test_awaiting_merge_rechecks_unchanged_hash
+test_awaiting_merge_missing_status_rechecks
+test_cancelled_run_declared_pause_absorbed
+test_wedge_acknowledged_by_declared_pause
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
 test_secondmate_unpause_clears_pause_tracking

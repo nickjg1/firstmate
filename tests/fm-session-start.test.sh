@@ -11,7 +11,12 @@
 #   - output section ordering: diagnostics/banners lead, bulk file dumps follow
 #   - context-aware next-step guidance for read-only, AFK, X mode, and normal
 #     watcher ownership
-#   - status-tail bounding, default and FM_SESSION_START_STATUS_TAIL override
+#   - wake-EVENT bounding per task, default and FM_SESSION_START_STATUS_TAIL override
+#   - the LEAN digest contract: output must not scale with the size of the home's
+#     data/ files, every summarized section must name the command that retrieves
+#     it, every field a first turn acts on must survive summarization, a small
+#     home must see no summarization at all, and FM_SESSION_START_FULL=1 must
+#     restore the whole files
 #   - orphan status logs whose task meta has already disappeared
 #   - per-task endpoint-liveness lines for a live and a dead recorded target,
 #     tmux and herdr both
@@ -436,19 +441,164 @@ EOF
   printf 'working: step 1\nworking: step 2\nworking: step 3\nworking: step 4\nworking: step 5\nworking: step 6\nworking: step 7\n' \
     > "$home/state/task-a.status"
 
+  # The default is ONE wake EVENT per task - the last - because that is what a
+  # first turn branches on, and the digest prints the command for the rest. A
+  # block of history per task is precisely the bulk that made the digest cost a
+  # full re-read on every later turn.
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "working: step 7" "default status tail missing the most recent line"
-  assert_contains "$out" "working: step 3" "default status tail (5 lines) missing an expected recent line"
-  assert_not_contains "$out" "working: step 1" "default status tail (5 lines) leaked an older line"
-  assert_contains "$out" "$home/state/task-a.status" "digest did not print the full status log path for a deeper read"
-  assert_contains "$out" "Do NOT bulk-read state/*.status now either: their bounded tails were just" "closing reminder does not distinguish bounded status tails"
-  assert_not_contains "$out" "state/*.status now - they were just" "closing reminder still describes status logs as fully printed"
+  assert_contains "$out" "working: step 7" "default digest missing the most recent wake event"
+  assert_not_contains "$out" "working: step 6" "default digest printed more than the last wake event per task"
+  assert_not_contains "$out" "working: step 1" "default digest leaked older wake-event history"
+  assert_contains "$out" "$home/state/<id>.status" "digest did not print the retrieval command for full wake-event history"
+  assert_contains "$out" "bin/fm-crew-state.sh <id>" "digest did not point at the live current-state read"
+  assert_contains "$out" "Reading a summarized" "closing reminder does not say on-demand retrieval is expected"
+  assert_not_contains "$out" "they were just printed in full" "closing reminder still claims everything was printed in full"
 
-  out=$(FM_SESSION_START_STATUS_TAIL=2 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "working: step 7" "FM_SESSION_START_STATUS_TAIL=2 tail missing the most recent line"
-  assert_not_contains "$out" "working: step 5" "FM_SESSION_START_STATUS_TAIL=2 did not bound the tail to 2 lines"
+  # Raising the knob adds the earlier events back, indented under the task line,
+  # without breaking the one-line-per-task shape.
+  out=$(FM_SESSION_START_STATUS_TAIL=3 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "working: step 7" "FM_SESSION_START_STATUS_TAIL=3 missing the most recent wake event"
+  assert_contains "$out" "earlier: working: step 5" "FM_SESSION_START_STATUS_TAIL=3 did not print the earlier events"
+  assert_not_contains "$out" "earlier: working: step 4" "FM_SESSION_START_STATUS_TAIL=3 did not bound the history to 3 lines"
 
-  pass "status tail is bounded to the configured line count, with the full log path always printed"
+  pass "the digest prints one wake event per task by default, with a knob for more and a pointer to the full log"
+}
+
+test_summary_clipping_preserves_routing_and_task_fields() {
+  local rec root home fakebin out task_line long_description
+  rec=$(new_world structured-summary)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:live"
+
+  long_description=$(head -c 500 /dev/zero | tr '\0' 'x')
+  printf -- '- route-a - %s (home: %s; scope: scope-that-must-survive-summary-clipping; projects: alpha; added 2026-08-12)\n' \
+    "$long_description" "$home/route-a" > "$home/data/secondmates.md"
+  printf -- '- app [no-mistakes] - %s (added 2026-08-12)\n' "$long_description" > "$home/data/projects.md"
+  printf 'window=fm-sess:live\nkind=ship\nmode=no-mistakes\npr=https://example.test/o/r/pull/123\n' \
+    > "$home/state/task-a.meta"
+  printf 'done: %s\n' "$(head -c 500 /dev/zero | tr '\0' 'z')" > "$home/state/task-a.status"
+
+  out=$(FM_SESSION_START_FULL_BYTES=1 FM_SESSION_START_LINE_MAX=80 \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "- route-a -" "the summarized secondmate line dropped its identity"
+  assert_contains "$out" "home: $home/route-a" "the summarized secondmate line dropped its home"
+  assert_contains "$out" "scope: scope-that-must-survive-summary-clipping" \
+    "the summarized secondmate line clipped its routing scope"
+  assert_contains "$out" "- app [no-mistakes] -" "the summarized project line dropped its mode"
+  assert_contains "$out" "(added 2026-08-12)" "the summarized project line clipped its structured date"
+  task_line=$(printf '%s\n' "$out" | grep '^task-a · ' | head -1)
+  assert_contains "$task_line" "tmux fm-sess:live endpoint=alive" "the task line dropped its endpoint liveness"
+  assert_contains "$task_line" "pr=https://example.test/o/r/pull/123" "the task line clipped its recorded PR"
+  assert_contains "$task_line" "last: done:" "the task line dropped its status field"
+  pass "summary clipping preserves routing fields and task routing fields while clipping only prose"
+}
+
+# The lean digest's whole purpose: the session-start output that lands in the
+# conversation - and is therefore re-read as context on EVERY later turn - must
+# not scale with the size of the home's data/ files. This test grows those files
+# well past the summarization threshold and asserts the digest stays small while
+# still carrying every field a first turn acts on.
+test_digest_stays_lean_as_data_grows() {
+  local rec root home fakebin out bytes i
+  rec=$(new_world lean-digest)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:live"
+
+  {
+    printf '# Fleet learnings\n\n'
+    i=1
+    while [ "$i" -le 30 ]; do
+      printf '## 2026-07-%02d - learning %s headline\n\n' "$i" "$i"
+      printf 'BODY-%s %s\n\n' "$i" "$(head -c 400 /dev/zero | tr '\0' 'x')"
+      i=$((i + 1))
+    done
+  } > "$home/data/learnings.md"
+  {
+    printf '# Captain preferences and working style\n\n'
+    printf '## Communication style\n\nCAPTAIN-BODY %s\n\n' "$(head -c 3000 /dev/zero | tr '\0' 'y')"
+  } > "$home/data/captain.md"
+  {
+    printf '## In flight\n- [ ] live-task-a1 - the one in flight (repo: x)\n'
+    i=2
+    while [ "$i" -le 45 ]; do
+      printf -- '- [ ] live-task-%s - another in-flight item\n' "$i"
+      i=$((i + 1))
+    done
+    printf '\n## Queued\n'
+    i=1
+    while [ "$i" -le 40 ]; do
+      printf -- '- [ ] queued-%s - QUEUED-BODY-%s %s\n' "$i" "$i" "$(head -c 300 /dev/zero | tr '\0' 'z')"
+      i=$((i + 1))
+    done
+  } > "$home/data/backlog.md"
+  printf 'window=fm-sess:live\nkind=ship\nmode=no-mistakes\npr=https://example.test/o/r/pull/9\n' \
+    > "$home/state/task-a.meta"
+  printf 'done: PR https://example.test/o/r/pull/9 checks green\n' > "$home/state/task-a.status"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  bytes=$(printf '%s' "$out" | wc -c | tr -d '[:space:]')
+
+  # ~90KB of data/ must not become ~90KB of conversation context.
+  [ "$bytes" -lt 16000 ] || fail "the digest did not stay lean as data/ grew: $bytes bytes"
+
+  # Bulk bodies stay out...
+  assert_not_contains "$out" "BODY-17" "a learnings body leaked into the lean digest"
+  assert_not_contains "$out" "CAPTAIN-BODY" "a captain-preferences body leaked into the lean digest"
+  assert_not_contains "$out" "QUEUED-BODY-31" "a queued backlog body leaked into the lean digest"
+
+  # ...while everything a first turn acts on stays in.
+  assert_contains "$out" "learning 17 headline" "the learnings heading index dropped an entry"
+  assert_contains "$out" "Communication style" "the captain heading index dropped an entry"
+  assert_contains "$out" "In flight=45" "the backlog summary lost its section counts"
+  assert_contains "$out" "live-task-a1" "the backlog summary dropped an in-flight item"
+  assert_contains "$out" "live-task-45" "the backlog summary capped the in-flight item list"
+  assert_contains "$out" "task-a" "the fleet digest dropped an in-flight task"
+  assert_contains "$out" "pr=https://example.test/o/r/pull/9" "the task line dropped its recorded PR"
+  assert_contains "$out" "endpoint=alive" "the task line dropped its endpoint liveness"
+  assert_contains "$out" "checks green" "the task line dropped its last wake event"
+
+  # Every summarized section names the command that retrieves it.
+  assert_contains "$out" "cat $home/data/learnings.md" "the learnings summary printed no retrieval command"
+  assert_contains "$out" "cat $home/data/captain.md" "the captain summary printed no retrieval command"
+  assert_contains "$out" "cat $home/data/backlog.md" "the backlog summary printed no retrieval command"
+
+  # The escape hatch restores the whole files.
+  out=$(FM_SESSION_START_FULL=1 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "CAPTAIN-BODY" "FM_SESSION_START_FULL=1 did not restore the whole captain file"
+  assert_contains "$out" "QUEUED-BODY-31" "FM_SESSION_START_FULL=1 did not restore the whole backlog"
+
+  pass "the digest stays lean as data/ grows, keeps every first-turn field, and names how to retrieve the rest"
+}
+
+# A small or fresh home must see no summarization at all: the threshold exists so
+# the lean digest costs nothing in behavior for homes where size is not a problem.
+test_small_home_digest_is_unsummarized() {
+  local rec root home fakebin out
+  rec=$(new_world small-home)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+
+  printf '# Fleet learnings\n\n## one thing\n\nSMALL-LEARNING-BODY\n' > "$home/data/learnings.md"
+  printf '# Captain\n\n## style\n\nSMALL-CAPTAIN-BODY\n' > "$home/data/captain.md"
+  printf '## In flight\n- [ ] a1 - SMALL-BACKLOG-BODY (repo: x)\n' > "$home/data/backlog.md"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "SMALL-LEARNING-BODY" "a small learnings file was summarized"
+  assert_contains "$out" "SMALL-CAPTAIN-BODY" "a small captain file was summarized"
+  assert_contains "$out" "SMALL-BACKLOG-BODY" "a small backlog was summarized"
+  assert_not_contains "$out" "SUMMARIZED below" "a small home saw a summary banner"
+  pass "a small or fresh home's digest is unsummarized, exactly as before"
 }
 
 test_orphan_status_logs_are_printed() {
@@ -468,10 +618,10 @@ EOF
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
 
   assert_contains "$out" "Orphan status logs (state/*.status without matching .meta)" "digest did not label orphan status logs"
-  assert_contains "$out" "--- task-orphan ---" "digest did not print the orphan status id"
-  assert_contains "$out" "orphan: step 6" "orphan status tail missing the newest line"
-  assert_not_contains "$out" "orphan: step 1" "orphan status tail was not bounded"
-  assert_contains "$out" "$home/state/task-orphan.status" "orphan status tail did not print the full log path"
+  assert_contains "$out" "task-orphan · last:" "digest did not print the orphan status id on its own line"
+  assert_contains "$out" "orphan: step 6" "orphan line missing the newest wake event"
+  assert_not_contains "$out" "orphan: step 1" "orphan line was not bounded to the last wake event"
+  assert_contains "$out" "$home/state/<id>.status" "digest did not print the retrieval command for full status history"
 
   matched_count=$(printf '%s\n' "$out" | grep -F -c 'matched: surfaced once')
   orphan_count=$(printf '%s\n' "$out" | grep -F -c 'orphan: step 6')
@@ -497,8 +647,8 @@ EOF
   printf 'window=fm-sess:dead-window\nkind=ship\n' > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "endpoint: alive (backend=tmux window=fm-sess:live-window)" "live tmux endpoint not reported alive"
-  assert_contains "$out" "endpoint: dead (backend=tmux window=fm-sess:dead-window)" "dead tmux endpoint not reported dead"
+  assert_contains "$out" "tmux fm-sess:live-window endpoint=alive" "live tmux endpoint not reported alive"
+  assert_contains "$out" "tmux fm-sess:dead-window endpoint=dead" "dead tmux endpoint not reported dead"
 
   pass "tmux endpoint liveness is reported per task: alive for a live window, dead for a gone one"
 }
@@ -517,8 +667,8 @@ EOF
   printf 'window=sess:p-dead\nkind=ship\nbackend=herdr\n' > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" "live herdr endpoint not reported alive"
-  assert_contains "$out" "endpoint: dead (backend=herdr window=sess:p-dead)" "dead herdr endpoint not reported dead"
+  assert_contains "$out" "herdr sess:p-live endpoint=alive" "live herdr endpoint not reported alive"
+  assert_contains "$out" "herdr sess:p-dead endpoint=dead" "dead herdr endpoint not reported dead"
 
   pass "herdr endpoint liveness is reported per task: alive for a live pane, dead for a gone one"
 }
@@ -745,6 +895,9 @@ test_lock_refusal_read_only_path
 test_output_ordering_diagnostics_lead
 test_herdr_backend_diagnostics_follow_real_session_start
 test_status_tail_bounding
+test_summary_clipping_preserves_routing_and_task_fields
+test_digest_stays_lean_as_data_grows
+test_small_home_digest_is_unsummarized
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
