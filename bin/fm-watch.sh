@@ -335,22 +335,32 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
 #
 # Called on any stale poll once the class is already known, so it must be cheap:
 # it NEVER re-reads the crew state. The recheck age is anchored on the crew's own
-# STATUS-FILE mtime, not a per-hash marker, so a churny idle pane (a ticking
-# clock, a token counter) cannot keep resetting the cadence the way a hash-tied
-# timer would. The <resurface-file> throttle records the last recheck epoch so,
+# STATUS-FILE mtime when readable, not a per-hash marker, so a churny idle pane (a
+# ticking clock, a token counter) cannot keep resetting the cadence the way a
+# hash-tied timer would. A durable first-seen marker is used when the status mtime
+# cannot be read. The <resurface-file> throttle records the last recheck epoch so,
 # once past the window, it fires once per window rather than every poll. Advances
 # the stale suppressor to <hash>, sets <flag-file>, and clears any wedge timer:
 # an expected idle pane is never a wedge.
 stale_idle_recheck() {  # <window> <task> <hash> <flag-file> <resurface-file> <secs> <age-label> <recheck-note>
   local win=$1 task=$2 h=$3 flag=$4 rf=$5 secs=$6 age_label=$7 note=$8
-  local key statusf mtime age rf_age reason
+  local key statusf first_seen mtime age rf_age reason
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$flag"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   statusf="$STATE/$task.status"
+  first_seen="$STATE/.idle-since-$key"
   mtime=$(stat_mtime "$statusf")
-  case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
+  case "$mtime" in
+    ''|*[!0-9]*)
+      mtime=$(cat "$first_seen" 2>/dev/null || true)
+      case "$mtime" in
+        ''|*[!0-9]*) date +%s > "$first_seen"; mtime=$(cat "$first_seen") ;;
+      esac
+      ;;
+    *) rm -f "$first_seen" ;;
+  esac
   age=$(( $(date +%s) - mtime ))
   rf_age=$(age_of "$rf")   # 999999 when no prior recheck
   if [ "$age" -ge "$secs" ] && [ "$rf_age" -ge "$secs" ]; then
@@ -384,12 +394,58 @@ handle_paused_stale() {  # <window> <task> <hash>
 # moment it lands. The bounded recheck below is the anti-rot backstop for a PR
 # that simply sits unmerged.
 handle_awaiting_merge_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key
+  local win=$1 task=$2 h=$3 key recheck_file
   key=$(printf '%s' "$win" | tr ':/.' '___')
+  recheck_file="$STATE/.awaiting-merge-rechecked-$key"
+  [ -e "$recheck_file" ] || date +%s > "$recheck_file"
   stale_idle_recheck "$win" "$task" "$h" \
     "$STATE/.awaiting-merge-$key" "$STATE/.merge-resurfaced-$key" "$AWAITING_MERGE_RESURFACE_SECS" \
     "awaiting merge" \
     "PR recorded and the merge poll is armed, rechecked on a long cadence not a wedge; confirm the PR is still open and wanted"
+}
+
+awaiting_merge_state_class() {  # <window> <task>
+  local win=$1 task=$2 key recheck_file class
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  recheck_file="$STATE/.awaiting-merge-rechecked-$key"
+  if [ -e "$STATE/.awaiting-merge-$key" ] \
+    && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
+    printf 'awaiting-merge'
+    return
+  fi
+  class=$(crew_absorb_class "$task")
+  case "$class" in
+    awaiting-merge)
+      date +%s > "$recheck_file"
+      ;;
+    *)
+      rm -f "$recheck_file"
+      ;;
+  esac
+  printf '%s' "$class"
+}
+
+recheck_awaiting_merge_stale() {  # <window> <task> <hash>
+  local win=$1 task=$2 h=$3 class
+  class=$(awaiting_merge_state_class "$win" "$task")
+  case "$class" in
+    awaiting-merge)
+      handle_awaiting_merge_stale "$win" "$task" "$h"
+      ;;
+    paused)
+      clear_pause_tracking "$win"
+      handle_paused_stale "$win" "$task" "$h"
+      ;;
+    working)
+      clear_pause_tracking "$win"
+      printf '%s' "$h" > "$STATE/.stale-$(printf '%s' "$win" | tr ':/.' '___')"
+      date +%s > "$STATE/.stale-since-$(printf '%s' "$win" | tr ':/.' '___')"
+      triage_log "absorbed stale (provably working after awaiting-merge recheck): $win"
+      ;;
+    *)
+      surface_nonterminal_stale "$win" "$h"
+      ;;
+  esac
 }
 
 clear_pause_state() {  # <window>
@@ -398,7 +454,7 @@ clear_pause_state() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key" \
-        "$STATE/.wedge-acked-$key"
+        "$STATE/.wedge-acked-$key" "$STATE/.idle-since-$key"
 }
 
 # Drop every idle-absorb and wedge marker for a window. Called wherever a pane's
@@ -412,7 +468,8 @@ clear_pause_tracking() {  # <window>
   key=${key//./_}
   clear_pause_state "$win"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" \
-        "$STATE/.awaiting-merge-$key" "$STATE/.merge-resurfaced-$key"
+        "$STATE/.awaiting-merge-$key" "$STATE/.awaiting-merge-rechecked-$key" \
+        "$STATE/.merge-resurfaced-$key"
 }
 
 pause_state_class() {  # <window> <task>
@@ -458,7 +515,8 @@ surface_nonterminal_stale() {  # <window> <hash>
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" \
         "$STATE/.paused-resurfaced-$key" "$STATE/.awaiting-merge-$key" \
-        "$STATE/.merge-resurfaced-$key" "$STATE/.wedge-acked-$key"
+        "$STATE/.awaiting-merge-rechecked-$key" "$STATE/.merge-resurfaced-$key" \
+        "$STATE/.wedge-acked-$key" "$STATE/.idle-since-$key"
   wake "stale: $win"
 }
 
@@ -919,9 +977,7 @@ EOF
                 ;;
             esac
           elif [ -e "$amf" ]; then
-            # This exact hash is already classified as a PR awaiting merge - keep
-            # rechecking it on the long cadence without re-reading the crew state.
-            handle_awaiting_merge_stale "$w" "$(window_to_task "$w" "$STATE")" "$h"
+            recheck_awaiting_merge_stale "$w" "$(window_to_task "$w" "$STATE")" "$h"
           elif [ -e "$ssf" ]; then
             # This exact hash was already overridden as provably-working (a
             # wedge timer is running for it) - keep treating it that way
@@ -972,12 +1028,7 @@ EOF
           else
             task=$(window_to_task "$w" "$STATE")
             if [ -e "$amf" ]; then
-              # Already classified as a PR awaiting merge on this hash: recheck on
-              # the long cadence, never re-read the crew state, and never let the
-              # every-poll surface path see it again. This is the repeat-poll half
-              # of the third fm-pause-vs-cancelled-run-c2 variant - without it, an
-              # unchanged hash fell straight back through to surface_nonterminal_stale.
-              handle_awaiting_merge_stale "$w" "$task" "$h"
+              recheck_awaiting_merge_stale "$w" "$task" "$h"
             elif [ -e "$pf" ] || status_is_paused "$(last_status_line "$STATE/$task.status")"; then
               case "$(pause_state_class "$w" "$task")" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
@@ -999,7 +1050,7 @@ EOF
         # means the pane is busy or its hash just moved, so whatever the crew is
         # doing now must be classified afresh rather than kept absorbed, and a
         # wedge acknowledgement no longer applies to a pane that has moved.
-        rm -f "$ssf" "$ewf" "$awf"
+        rm -f "$ssf" "$ewf" "$awf" "$STATE/.idle-since-$key"
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
         elif [ -e "$amf" ]; then
@@ -1009,7 +1060,7 @@ EOF
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
-      rm -f "$ssf" "$ewf" "$awf"
+      rm -f "$ssf" "$ewf" "$awf" "$STATE/.idle-since-$key"
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && ! window_is_busy "$w" "$tail40"; then
         case "$(pause_state_class "$w" "$task")" in

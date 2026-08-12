@@ -143,6 +143,9 @@ case "$LINE" in *"fm-teardown.sh merged-h9"*) ;; *) fail "a fired merge poll mus
 LINE=$(brief "$(rec signal merged-h9.status 'signal: merged something')")
 case "$LINE" in *"fm-pr-merge.sh"*) fail "a merged-or-closed run was briefed with a merge command: $LINE" ;; esac
 case "$LINE" in *"fm-teardown.sh merged-h9"*) ;; *) fail "a merged-or-closed run did not brief teardown: $LINE" ;; esac
+LINE=$(brief "$(rec signal merged-h9.status 'stale: test:merged-h9 (awaiting merge, recheck)')")
+case "$LINE" in *"fm-pr-merge.sh"*) fail "a stale awaiting-merge payload overrode current merged state: $LINE" ;; esac
+case "$LINE" in *"fm-teardown.sh merged-h9"*) ;; *) fail "a stale awaiting-merge payload did not use current merged state: $LINE" ;; esac
 pass "a fired merge poll and a merged-or-closed run both brief teardown without a merge command"
 
 reset_state

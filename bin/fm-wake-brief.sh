@@ -214,10 +214,6 @@ next_action() {  # <task> <state> <payload> <open-decisions> <wake-kind> <crew-s
       printf 'declared external wait, rechecked on a long cadence - confirm the wait still holds, otherwise no action'
       return
       ;;
-    *"awaiting merge"*)
-      printf 'PR still open and unmerged - confirm it is still wanted, otherwise no action (the merge poll is armed)'
-      return
-      ;;
   esac
 
   pr=$(meta_field "$task" pr)
