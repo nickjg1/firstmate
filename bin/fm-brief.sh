@@ -39,6 +39,11 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
+# Every scaffold also carries the decision-cost contract, which is THE owner of
+# how many supervisor turns a crew is allowed to cost: batch every pending
+# question into ONE needs-decision instead of serializing them, and (for
+# no-mistakes ship briefs) treat pipeline-auto-fixable findings as already
+# authorized rather than escalating them.
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
@@ -165,6 +170,7 @@ Report only true captain-relevant outcomes or a declared external wait by append
 States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act.
 Use this only for material phase changes, a captain decision, a real blocker, a failure, or work ready for review.
+Batch decisions: every escalation costs the main firstmate a full turn, so gather every question already pending or clearly coming into ONE numbered \`needs-decision\` line rather than sending them one at a time.
 This is also how you return the answer to a marked from-firstmate request above.
 When a decision you escalated is answered or a blocker clears and your domain resumes, append \`resolved: {how it was decided or unblocked}\` (keyed with \`[key=<slug>]\` if you opened it with one) so it is durably closed instead of resurfacing behind later unrelated events.
 Routine internal supervision, heartbeats, retries, and crewmate churn stay inside your own home and must not touch that status file.
@@ -250,6 +256,11 @@ The report is the only thing that survives, so anything worth keeping must be in
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+   **Batch your questions.** Every \`needs-decision\` costs a full supervisor turn, so before you
+   stop, look ahead for every other question already pending or clearly coming, and put them in ONE
+   numbered \`needs-decision\` line. Never serialize one question per append when you could have asked
+   them together. Decide as much as you legitimately can yourself first: anything the task, the brief,
+   or an existing convention already answers is not a decision - it is work.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
@@ -311,7 +322,8 @@ You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
 
-Two firstmate-specific rules layer on top of that guidance:
+Three firstmate-specific rules layer on top of that guidance:
+- **Standing authorization.** A finding the pipeline can resolve on its own - anything it presents at an auto-fix severity, or any gate it can advance without asking a human - is already authorized. Respond and let the pipeline apply it; never turn one into a \`needs-decision\`. Only a genuine ask-user finding belongs to a human.
 - ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
@@ -357,6 +369,11 @@ $RULE1
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+   **Batch your questions.** Every \`needs-decision\` costs a full supervisor turn, so before you
+   stop, look ahead for every other question already pending or clearly coming, and put them in ONE
+   numbered \`needs-decision\` line. Never serialize one question per append when you could have asked
+   them together. Decide as much as you legitimately can yourself first: anything the task, the brief,
+   or an existing convention already answers is not a decision - it is work.
    When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes

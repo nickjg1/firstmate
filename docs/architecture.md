@@ -16,9 +16,29 @@ No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign 
 A crew that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
+
+`bin/fm-classify-lib.sh`'s `crew_absorb_class` is the single owner of which idle panes are expected, and it recognizes three absorb classes plus `none`.
+`working` is the active-run or busy-pane case above.
+`paused` is a declared external wait; it is also returned when the run-step verdict is TERMINAL and the status log declares a pause, because a run that has passed, failed, or been cancelled cannot resume and so is not evidence about what the crew is doing now - extending run-step precedence to a terminal run is what let a cancelled run defeat pause absorption entirely.
+`awaiting-merge` is a run that finished green on a PR the task meta records as `pr=`.
+That field is written only by `bin/fm-pr-check.sh` and `bin/fm-pr-merge.sh`, so its presence proves the first mate was already told about the PR and has already armed the per-task merge poll; repeating the crew's idle pane as a stale wake therefore carries no new information, and the merge poll remains the real wake path.
+Before that class existed, such a crew tripped a stale wake every poll from the moment its run went terminal until teardown - measured at every 30 to 60 seconds for hours across a day of unmerged PRs, and the single largest source of spurious supervision wakes in the fleet.
+Both idle-absorb classes share one bounded recheck mechanism anchored on the crew's own status-file mtime, so a churny idle pane cannot reset the cadence, and a forgotten pause or an abandoned PR still re-surfaces once per window.
+
+Run-step precedence has one further limit, on the wedge timer rather than the absorb class.
+An active run keeps a crew classed `working` even behind a declared pause, which is correct for the signal path but left a pane whose agent had exited under a still-open run repeating the identical possible-wedge alarm with no way to acknowledge it.
+Once the alarm has fired past `FM_WEDGE_DEMAND_INSPECT_COUNT` and a pause is declared, the supervisor has demonstrably both seen the alarm and declared the wait, so the escalation de-escalates to the bounded pause recheck instead of repeating; the escalation count resets wherever the pane becomes active again.
+
+On the push (native-event) path, a blocked transition is classified against the status log before it escalates.
+The backend's per-pane dedupe marker only survives until the next `working` edge clears it, and a crew parked at a no-mistakes gate flickers between working and blocked as its TUI redraws, so the same already-relayed gate re-escalated on every watcher cycle.
+A blocked edge is now absorbed when the crew declares a pause, when its captain-relevant status line is already recorded as surfaced (that gate has already woken the first mate), or when an identical status line produced the same escalation for that pane within `FM_PUSH_RESURFACE_SECS`.
+A different status line, a first sighting, or a repeat past that window still escalates immediately.
 No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 After each drain, `fm-wake-drain.sh` runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
+The drain also prints a wake brief below the durable records (`bin/fm-wake-brief.sh`): one compact line per wake carrying the task, its current state, its last status line, and a deterministic next action.
+Those are exactly the follow-up reads a supervisor otherwise repeats by hand for every wake - the status file, the meta, and the crew's current state - so doing them once in bash is what makes handling a wake cost one read instead of several LLM turns.
+The deeper tools stay authoritative and unchanged; a brief line names them whenever it cannot resolve the state itself.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
 Crew status files are append-only wake-event logs, not current-state fields.
@@ -33,6 +53,25 @@ For whole-fleet read-only review, `bin/fm-fleet-snapshot.sh --json` emits schema
 `bin/fm-fleet-view.sh` renders that snapshot as Markdown for humans, while `bin/fm-bearings-snapshot.sh` provides the bounded bearings projection, so both views consume one structured contract instead of reparsing raw fleet files.
 The script header owns the exact JSON schema.
 Optional X mode rides the same check path: the locked session-start bootstrap step drops a local `state/x-watch.check.sh` shim only after the user opts in with `FMX_PAIRING_TOKEN`, and non-X homes keep the default watcher behavior.
+
+## Session start is conversation context, so it is lean by default
+
+`bin/fm-session-start.sh` prints one ordered digest, and that digest lands in the primary's conversation.
+Its cost is therefore not paid once at session start: every later turn re-reads all of it as context, so a home whose `data/` files have grown to tens of KB pays that tax on every single turn.
+Measurement on a real fleet home (2026-08-12, `data/` totalling roughly 82KB across projects, captain, learnings, and backlog, with four in-flight tasks) put the pre-lean digest at 95,455 bytes, or very roughly 24k tokens re-read per turn.
+That is the mechanism behind the orchestrator consuming several times what all crews combined consume.
+
+The digest is now lean by default: it prints what the first mate needs to act correctly on the first turn, and for everything else an exact retrieval command.
+The two routing tables keep one line per entry, because intake resolves a project and a secondmate scope from them on every request; only each entry's trailing prose is clipped.
+`data/captain.md` and `data/learnings.md` reduce to their heading index, because those headings already name what each section covers.
+`data/backlog.md` reduces to section counts plus its in-flight items.
+Each in-flight task becomes one line carrying its kind, mode, backend endpoint and liveness, recorded PR, and last wake EVENT, instead of a full meta block plus a status tail.
+The lock banner, bootstrap diagnostics, the wake queue and its brief, the supervision block, `ABSENT` markers, and the afk flag are never summarized: they are load-bearing and already short.
+The same measurement puts the lean digest at 10,560 bytes, roughly 2.6k tokens - a 9x reduction with no first-turn field dropped.
+
+Two properties keep this from being a loss of information rather than a change of shape.
+A file at or under `FM_SESSION_START_FULL_BYTES` still prints whole, so a small or fresh home sees exactly the previous digest and only homes big enough for size to matter get a summary.
+And every summarized section prints the command that retrieves it, because the read-once rule governs the digest's own sections, not a targeted follow-up the digest itself told you how to make; `FM_SESSION_START_FULL=1` restores the whole files outright.
 
 At session start, `bin/fm-session-start.sh` emits exactly one primary-harness supervision block rendered by `bin/fm-supervision-instructions.sh` from `docs/supervision-protocols/`.
 That block owns the live wait shape for the running primary harness: Claude and Grok use background-notify cycles, Codex uses bounded foreground checkpoints, Pi uses its two tracked primary extensions, and OpenCode uses its TUI plugin.

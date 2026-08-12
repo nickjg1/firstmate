@@ -130,19 +130,27 @@ It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - ca
    The secondmate liveness sweep deterministically guarantees every registered secondmate is actually running: it probes each live secondmate's endpoint for a real agent process (not just pane presence) and respawns only on a confident dead reading, reported as `SECONDMATE_LIVENESS:` lines (`bin/fm-bootstrap.sh`; `bin/fm-backend.sh`'s `fm_backend_agent_alive`).
 3. **Wake queue** - when locked, drains the durable wake queue and prints the records prominently as this turn's first work queue, exactly as `bin/fm-wake-drain.sh` did before; a lapsed watcher chain still surfaces here via the same guard banner.
    When the lock could not be acquired, the queue is left untouched because another session owns it, and the guard's tangle/watcher-liveness alarms still print in read-only advisory mode without drain, supervision repair, or checkout repair commands.
-4. **Context digest** - the full contents of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, and `data/learnings.md`, each clearly delimited.
+4. **Context digest** - `data/projects.md`, `data/secondmates.md`, `data/captain.md`, and `data/learnings.md`, each clearly delimited.
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use this template's defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
-5. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
-   That liveness line is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
+5. **Fleet-state digest** - `data/backlog.md`; one line per in-flight task carrying its kind, mode, backend endpoint and alive/dead reading, recorded `pr=`, and last status EVENT; orphan status logs; and the `state/.afk` flag.
+   That liveness reading is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>`; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
 6. **Supervision operating instructions and next step** - after the wake queue and before context, the digest emits exactly one operating block for the detected primary harness.
    The closing reminder points back to that emitted block and preserves only the lock, afk, X-mode, and read-once reminders.
    The script itself never starts supervision; the emitted harness protocol owns the exact wait or wake mechanism.
 
-**Everything in this digest is read exactly once, at session start.**
-Do not separately run `bin/fm-bootstrap.sh`, `bin/fm-lock.sh`, or `bin/fm-wake-drain.sh`, and do not separately read `data/projects.md`, `data/secondmates.md`, `data/captain.md`, `data/learnings.md`, `data/backlog.md`, or any `state/*.meta` afterward - they were just printed in full, and re-reading them defeats the entire point of collapsing session start into one command.
-Do not bulk-read `state/*.status` afterward either: the digest printed bounded tails with full log paths for targeted follow-up when older wake-event history is actually needed.
-Re-read a file only if the digest flagged it `ABSENT` (then rebuild or create it per the guidance in this section and section 6), its contents looked unparseable or corrupt, or an individual full status log is needed for older wake-event history.
-This read-once rule does not block a targeted current-state read immediately before a workflow writes one of these files, such as `/stow`'s inspect-then-update pass or a backlog backend mutation.
+**The digest is lean by default, and it is read exactly once, at session start.**
+The digest lands in your conversation, so its cost is not paid once - every later turn re-reads all of it as context.
+It therefore prints what you need to act correctly on the first turn and summarizes the rest, and every summarized section ends with the exact command that retrieves its full content.
+The routing tables keep one line per entry, `data/captain.md` and `data/learnings.md` reduce to their heading index, and `data/backlog.md` reduces to section counts plus its in-flight items.
+`ABSENT` markers, the lock banner, bootstrap diagnostics, the wake queue and its brief, the supervision block, and the afk flag are never summarized - they are load-bearing and short.
+`FM_SESSION_START_FULL=1` prints every summarized file whole; `docs/configuration.md` owns the other size knobs.
+
+**Read once, then retrieve on demand.**
+Do not separately run `bin/fm-bootstrap.sh`, `bin/fm-lock.sh`, or `bin/fm-wake-drain.sh` afterward, and do not answer a summarized section by bulk-reading the sources back in: a blanket sweep of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, `data/learnings.md`, `data/backlog.md`, `state/*.meta`, or `state/*.status` defeats the entire point of collapsing session start into one command, and every byte it pulls in is re-read on every later turn.
+A **targeted** retrieval is expected, not a violation: when you are about to act on what a summarized section holds, run that section's printed pointer command for that one thing - the captain preference governing what you are writing, the learning covering the area you are touching, the queued backlog item you are dispatching, one task's full meta or wake-event history.
+Prefer `bin/fm-crew-state.sh <id>` over any status log for a crew's current state, and `bin/fm-fleet-view.sh` for the whole fleet.
+Re-read a whole file only if the digest flagged it `ABSENT` (then rebuild or create it per the guidance in this section and section 6) or its contents looked unparseable or corrupt.
+This rule does not block a targeted current-state read immediately before a workflow writes one of these files, such as `/stow`'s inspect-then-update pass or a backlog backend mutation.
 Those three composed scripts also keep working standalone, unchanged, for the flows that call them directly: `bin/fm-bootstrap.sh install <tools>` after consent, `/updatefirstmate`, the afk daemon, and existing tests.
 
 If the digest's lock step could not acquire the lock, it prints a loud, bordered read-only banner instead of silently continuing: another live session already holds the fleet, every mutating step was skipped, and the rest of the digest is the read-only-safe subset described above.
@@ -156,7 +164,8 @@ For a mid-session inheritable-config change that should reach live secondmates w
 Silence in the bootstrap section of the digest means all good: say nothing and move on.
 Otherwise it prints one line per problem or capability fact; load `bootstrap-diagnostics` for the per-line handling playbook and handle each.
 
-The digest's context section already contains `data/projects.md`, the fleet registry of what each project is; `data/secondmates.md`, the registered secondmate routing table used to route work by scope (section 7); `data/captain.md`, this captain's curated preferences and working style; and `data/learnings.md`, fleet-local operational facts and gotchas this home has captured.
+The digest's context section already covers `data/projects.md`, the fleet registry of what each project is; `data/secondmates.md`, the registered secondmate routing table used to route work by scope (section 7); `data/captain.md`, this captain's curated preferences and working style; and `data/learnings.md`, fleet-local operational facts and gotchas this home has captured.
+The two registries keep every entry, so intake can route from the digest alone; the two curated files are indexed by heading, so retrieve the one section that governs what you are about to do rather than the whole file.
 Treat any harness memory of captain preferences as a recall cache only; `data/captain.md` is the canonical, harness-portable home.
 If the digest reported `data/projects.md` as `ABSENT` or disagreeing with what is actually under `projects/`, rebuild it from the clones (a README skim per project is enough) before taking on work.
 An `ABSENT` `data/captain.md` or `data/secondmates.md` or `data/learnings.md` means exactly what section 2 says it means (template defaults, no registered secondmates, nothing captured yet) - not a problem to fix.
@@ -473,6 +482,7 @@ Load `harness-adapters` for the target harness's skill invocation form; natural 
 The crewmate drives the no-mistakes pipeline (review, test, document, lint, push, PR, CI) itself.
 The ship brief intentionally does not restate no-mistakes gate mechanics; it points the crewmate to the version-matched SKILL.md loaded by `/no-mistakes`, `no-mistakes axi run --help`, and per-response `help` lines.
 Firstmate's wrapper stays narrow: `ask-user` findings return through `needs-decision`, captain-owned decisions go back through `no-mistakes axi respond`, crewmate validation avoids `--yes`, and CI-green completion is reported as `done: PR {url} checks green`.
+Findings the pipeline can resolve itself carry standing authorization and never cost a round-trip: only a genuine `ask-user` finding is a captain decision, and a crew that escalates an auto-fixable one is steered back rather than relayed.
 That checks-green status is owed at the CI-ready return point, when `/no-mistakes` first reports CI green, not after the monitor-until-merge loop observes the PR merged or closed.
 Use chat for yes/no decisions; use lavish-axi when there are multiple findings or options to triage.
 
@@ -546,14 +556,17 @@ Whenever at least one task is in flight, keep exactly one live supervision wait 
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
 **Always-on wake triage (absorb only when provably working).**
-`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane, read via `bin/fm-crew-state.sh`), a declared `paused:` external wait until its bounded recheck cadence, and no-change heartbeats.
+`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crews with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane, read via `bin/fm-crew-state.sh`), a declared `paused:` external wait until its bounded recheck cadence, a crew parked on a PR you already recorded with `bin/fm-pr-check.sh` until its own bounded recheck, and no-change heartbeats.
 It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
+The same holds for a PR awaiting merge: the crew's own `done: PR ... checks green` signal still surfaces once, after which the armed merge poll is the wake path and the idle pane is not - so never hand-append a status line to quiet such a pane.
 Repeated provably-working stale escalations on one unchanged pane eventually add `demand-deep-inspection` to the wake reason so it is not mistaken for another routine validation wait.
 `docs/architecture.md` ("Event-driven supervision") owns the full classification mechanism, its thresholds, and the shared classifier library; while `state/.afk` exists the daemon owns triage and the watcher surfaces every wake to it.
 At the start of every wake-handling turn, run `bin/fm-wake-drain.sh` before peeking panes, reading status files beyond the reason line, or starting new work.
 Session-start recovery is the exception: `bin/fm-session-start.sh` already drained the queue when locked, or deliberately skipped the drain when read-only because another session owns it.
 The printed reason line is still useful, but the drained queue is the lossless backlog.
+The drain prints a **wake brief** under the records: one compact line per wake giving the task, its current state, its last status line, and the single next action.
+That brief is the default path - act from it, and reach for `bin/fm-crew-state.sh`, `bin/fm-peek.sh`, or `bin/fm-fleet-view.sh` only when a brief line says to or when it reports the state unreadable.
 **Keep exactly one live cycle.**
 The live cycle is the supervision: while any task is in flight, the active harness protocol must maintain one wait that can wake this primary when `bin/fm-watch.sh` reports an actionable reason.
 After handling drained wakes, resume the emitted harness protocol before ending the turn.
@@ -575,7 +588,7 @@ bin/fm-watch-arm.sh                 # verified arm wrapper used by harness proto
 bin/fm-watch-arm.sh --restart       # home-scoped forced restart; never a broad pkill
 bin/fm-watch-checkpoint.sh          # bounded foreground watcher checkpoint for Codex-style protocols
 bin/fm-watch.sh                     # the watcher itself; exits with: signal|stale|check|heartbeat
-bin/fm-wake-drain.sh                # drain queued wake records at turn start; asserts guard after draining
+bin/fm-wake-drain.sh                # drain queued wake records at turn start; prints the wake brief; asserts guard after draining
 bin/fm-crew-state.sh <id>           # one-line current-state read; reconciles matching run-step, pane, and status log
 bin/fm-fleet-view.sh                # read-only Markdown whole-fleet view rendered from the structured snapshot
 ```
@@ -742,6 +755,7 @@ Keep the charter focused on persistent responsibility, available project clones,
 Preserve the requests-from-main-firstmate contract in the charter: marked requests return via status or a doc pointer, while unmarked direct captain messages stay conversational.
 Before seeding, launching, recovering, or handing backlog to a secondmate home, load `secondmate-provisioning`.
 The status-reporting protocol is intentionally sparse: crewmates append status only for supervisor-actionable phase changes, `needs-decision`/`blocked`/`paused`/`done`/`failed`, or the `resolved` line that closes a previously reported decision or blocker, because every append wakes firstmate.
+For the same reason the scaffold makes crewmates batch every pending question into one `needs-decision` rather than serializing them; `bin/fm-brief.sh` owns that decision-cost contract in full.
 `bin/fm-classify-lib.sh` owns the keyed open/resolved status contract.
 For any generated brief that still contains `{TASK}`, replace it with a clear task description, acceptance criteria, and any constraints or context the crewmate needs before spawning or seeding.
 Adjust the other sections only when the task genuinely deviates from the standard ship-a-new-PR shape (e.g. fixing an existing external PR); the scaffold is the contract, not a suggestion.

@@ -103,25 +103,12 @@ log_last_line() {
   [ -f "$LOG" ] || return 1
   grep -v '^[[:space:]]*$' "$LOG" 2>/dev/null | tail -1
 }
-# Map a status-log verb onto a canonical state for the fallback path. `paused` is
-# the deliberate-external-wait verb (fm-classify-lib.sh's FM_CLASSIFY_PAUSED_VERB):
-# a crew with no active run and an idle pane that declared a known external wait
-# reports `paused` distinctly, so a supervisor reading this sees a declared pause
-# and its reason rather than a wedge-suspect idle.
-map_log_state() {  # <line>
-  if status_is_paused "$1"; then
-    echo paused
-    return
-  fi
-  case "$(status_line_verb "$1")" in
-    working)        echo working ;;
-    needs-decision) echo parked ;;
-    blocked)        echo blocked ;;
-    done)           echo "done" ;;
-    failed)         echo failed ;;
-    *)              echo unknown ;;
-  esac
-}
+# The verb -> canonical-state mapping used by the no-run fallback below is
+# fm-classify-lib.sh's map_log_state (sourced above), so the same mapping serves
+# every reader. `paused` is the deliberate-external-wait verb: a crew with no
+# active run and an idle pane that declared a known external wait reports
+# `paused` distinctly, so a supervisor reading this sees a declared pause and its
+# reason rather than a wedge-suspect idle.
 
 LOG_LINE=$(log_last_line || true)
 LOG_VERB=$(status_line_verb "$LOG_LINE")

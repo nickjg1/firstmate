@@ -34,9 +34,14 @@
 #                       when locked.
 #   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/learnings.md: read-only, always safe, always runs.
-#   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
-#                       state/*.status tail, state/.afk, and a cheap
-#                       per-task endpoint-liveness read: read-only, always runs.
+#   5. fleet digest   - data/backlog.md, one line per state/*.meta task with its
+#                       endpoint liveness and last status EVENT, orphan status
+#                       logs, and state/.afk: read-only, always runs.
+#
+# LEAN BY DEFAULT: this digest is conversation context, so it is re-read on every
+# later turn, not just at session start. Sections 4 and 5 therefore summarize
+# large inputs and print the exact retrieval command for each; see "digest size
+# discipline" below for the rule, the knobs, and what stays verbatim.
 #   6. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
@@ -82,8 +87,37 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 
-STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
-case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
+# Wake-EVENT lines shown per task. One - the last - is what a first turn branches
+# on, and the digest prints the command for the rest, so the default is 1 rather
+# than the block of 5 this printed before. Raise it when a home genuinely wants
+# more history inline; the extra lines print indented under the task line.
+STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-1}
+case "$STATUS_TAIL" in ''|*[!0-9]*|0) STATUS_TAIL=1 ;; esac
+
+# --- digest size discipline -------------------------------------------------
+#
+# This digest lands in the primary's CONVERSATION, so its cost is not paid once
+# at session start: every later turn re-reads the whole thing as context. A home
+# whose data/ files have grown to tens of KB therefore pays that tax on every
+# single turn, which measurement showed to be the dominant share of orchestrator
+# spend. So the digest is LEAN BY DEFAULT: it prints what is needed to act
+# correctly on the first turn, and an exact retrieval command for the rest.
+#
+# What stays verbatim, because it is load-bearing and short: the lock banner,
+# bootstrap diagnostics, the wake queue and its brief, the supervision block, the
+# ABSENT markers, and the afk flag. What gets summarized: the large data/ files
+# and the per-task meta blocks.
+#
+# A file at or under FULL_BYTES still prints in full, so a small or fresh home
+# sees exactly today's digest; only homes big enough for the size to matter get
+# a summary. FM_SESSION_START_FULL=1 forces the old whole-file digest.
+FULL_BYTES=${FM_SESSION_START_FULL_BYTES:-2000}
+case "$FULL_BYTES" in ''|*[!0-9]*) FULL_BYTES=2000 ;; esac
+LINE_MAX=${FM_SESSION_START_LINE_MAX:-200}
+case "$LINE_MAX" in ''|*[!0-9]*) LINE_MAX=200 ;; esac
+INDEX_MAX=${FM_SESSION_START_INDEX_MAX:-40}
+case "$INDEX_MAX" in ''|*[!0-9]*) INDEX_MAX=40 ;; esac
+FORCE_FULL=${FM_SESSION_START_FULL:-0}
 
 RULE='================================================================================'
 SUBRULE='--------------------------------------------------------------------------------'
@@ -91,30 +125,106 @@ SUBRULE='-----------------------------------------------------------------------
 section() { printf '\n%s\n%s\n%s\n' "$RULE" "$1" "$RULE"; }
 subsection() { printf '\n%s\n%s\n' "$1" "$SUBRULE"; }
 
-# print_file_or_absent <path> <label>: full contents under a labeled
-# subsection, or an explicit ABSENT marker. Absence is semantically
+# Cut a line to LINE_MAX characters, marking any cut so a reader can tell a
+# truncated entry from a short one and knows the rest exists.
+clip() {
+  awk -v max="$LINE_MAX" '{ if (length($0) > max) print substr($0, 1, max) " …"; else print }'
+}
+
+# file_size <path>: byte count, or 0 when unreadable.
+file_size() {
+  wc -c < "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+# print_file_header <path> <label>: open the subsection and report presence.
+# Prints ABSENT / (present, empty) and returns 1 when there is no body to
+# summarize, 0 when the caller should render one. Absence is semantically
 # meaningful for every one of these files (captain.md absent = template
 # defaults, projects.md absent = rebuild from clones, etc. - AGENTS.md
 # section 3) and must never be confused with an empty-but-present file, so
-# the two cases print differently.
-print_file_or_absent() {
+# the two cases print differently and BOTH stay verbatim in the lean digest.
+print_file_header() {
   local path=$1 label=$2
   subsection "$label"
-  if [ -f "$path" ]; then
-    if [ -s "$path" ]; then
-      cat "$path"
-    else
-      printf '(present, empty)\n'
-    fi
-  else
+  if [ ! -f "$path" ]; then
     printf 'ABSENT\n'
+    return 1
+  fi
+  if [ ! -s "$path" ]; then
+    printf '(present, empty)\n'
+    return 1
+  fi
+  return 0
+}
+
+# 0 when <path> should print whole: forced full, or small enough that summarizing
+# it would save nothing worth the indirection.
+print_whole() {
+  local path=$1 size
+  [ "$FORCE_FULL" = 1 ] && return 0
+  size=$(file_size "$path")
+  case "$size" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$size" -le "$FULL_BYTES" ]
+}
+
+# The retrieval pointer every summarized section ends with. Re-reading a
+# summarized section on demand is EXPECTED, not a violation of the read-once
+# rule: read-once governs the digest's own sections, not a targeted follow-up
+# the digest itself told you how to make.
+pointer() {  # <what> <command>
+  printf '  -> full %s: %s\n' "$1" "$2"
+}
+
+# md_index <path>: the file's Markdown headings, one per line, capped at
+# INDEX_MAX. For data/learnings.md and data/captain.md the headings ARE the
+# index - each names what its section is about - so listing them tells the
+# reader exactly which section to retrieve without carrying any body text.
+# Falls back to top-level list items for a file with no headings.
+md_index() {
+  local path=$1 pattern='^#\{1,6\} ' total
+  # grep -c both prints 0 and exits 1 on no match, so count through a plain
+  # pipeline rather than `grep -c ... || printf 0`, which would concatenate the
+  # two zeroes into a bogus "00".
+  total=$(grep -c "$pattern" "$path" 2>/dev/null | tr -d '[:space:]')
+  case "$total" in ''|*[!0-9]*) total=0 ;; esac
+  if [ "$total" -eq 0 ]; then
+    pattern='^- '
+    total=$(grep -c "$pattern" "$path" 2>/dev/null | tr -d '[:space:]')
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    [ "$total" -eq 0 ] && { printf '  (no headings or list entries to index)\n'; return 0; }
+  fi
+  grep "$pattern" "$path" 2>/dev/null | head -n "$INDEX_MAX" | clip | sed 's/^/  /'
+  [ "$total" -gt "$INDEX_MAX" ] && printf '  ... %s more (index capped at %s)\n' \
+    "$((total - INDEX_MAX))" "$INDEX_MAX"
+  return 0
+}
+
+# summary_line <path>: the one-line size banner every summarized section opens
+# with, so the reader always knows how much was withheld.
+summary_line() {
+  printf '%s line(s), %s bytes - SUMMARIZED below.\n' \
+    "$(grep -c '' "$1" 2>/dev/null || printf '0')" "$(file_size "$1")"
+}
+
+# The last wake-EVENT line, clipped, for the inline end of a task line. The full
+# log is a targeted follow-up, and the pointer to it is printed once per section.
+print_status_last() {
+  local status=$1
+  if [ -f "$status" ]; then
+    grep -v '^[[:space:]]*$' "$status" 2>/dev/null | tail -1 | clip
+  else
+    printf '(no status file yet)\n'
   fi
 }
 
-print_status_tail() {
+# The earlier wake EVENTS a raised FM_SESSION_START_STATUS_TAIL asked for, one
+# indented line each; silent at the default of 1.
+print_status_extra() {
   local status=$1
-  printf 'status tail (last %s line(s), wake-EVENT history, not current state; full log: %s):\n' "$STATUS_TAIL" "$status"
-  tail -n "$STATUS_TAIL" "$status"
+  [ "$STATUS_TAIL" -gt 1 ] || return 0
+  [ -f "$status" ] || return 0
+  grep -v '^[[:space:]]*$' "$status" 2>/dev/null \
+    | tail -n "$STATUS_TAIL" | sed '$d' | clip | sed 's/^/    earlier: /'
 }
 
 hash_file() {
@@ -226,46 +336,139 @@ fi
   --x-mode "$X_MODE_PRESENT"
 
 # --- 4. context digest -----------------------------------------------------
+# The two routing tables (projects, secondmates) keep one line PER ENTRY, because
+# intake resolves a project and a secondmate scope from those lines on every
+# request. Only each entry's trailing prose is clipped - the identity, mode, and
+# scope that do the routing always survive. The two curated knowledge files
+# (captain, learnings) are reduced to their heading index, because their headings
+# already name what each section covers, so the index is enough to know when to
+# go read one.
 section "CONTEXT"
-print_file_or_absent "$DATA/projects.md" "data/projects.md"
-print_file_or_absent "$DATA/secondmates.md" "data/secondmates.md"
-print_file_or_absent "$DATA/captain.md" "data/captain.md"
-print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
+
+if print_file_header "$DATA/projects.md" "data/projects.md"; then
+  if print_whole "$DATA/projects.md"; then
+    cat "$DATA/projects.md"
+  else
+    summary_line "$DATA/projects.md"
+    printf 'Registry entries (name, mode, +yolo, clipped description):\n'
+    grep '^- ' "$DATA/projects.md" 2>/dev/null | clip | sed 's/^/  /'
+    pointer "registry" "cat $DATA/projects.md"
+  fi
+fi
+
+if print_file_header "$DATA/secondmates.md" "data/secondmates.md"; then
+  if print_whole "$DATA/secondmates.md"; then
+    cat "$DATA/secondmates.md"
+  else
+    summary_line "$DATA/secondmates.md"
+    printf 'Routing table (id, scope, home, clipped):\n'
+    grep '^- ' "$DATA/secondmates.md" 2>/dev/null | clip | sed 's/^/  /'
+    pointer "routing table" "cat $DATA/secondmates.md"
+  fi
+fi
+
+if print_file_header "$DATA/captain.md" "data/captain.md"; then
+  if print_whole "$DATA/captain.md"; then
+    cat "$DATA/captain.md"
+  else
+    summary_line "$DATA/captain.md"
+    printf 'Preference sections (read the one that governs what you are about to do):\n'
+    md_index "$DATA/captain.md"
+    pointer "captain preferences" "cat $DATA/captain.md"
+  fi
+fi
+
+if print_file_header "$DATA/learnings.md" "data/learnings.md"; then
+  if print_whole "$DATA/learnings.md"; then
+    cat "$DATA/learnings.md"
+  else
+    summary_line "$DATA/learnings.md"
+    printf 'Recorded learnings (read one before working in the area it names):\n'
+    md_index "$DATA/learnings.md"
+    pointer "learnings" "cat $DATA/learnings.md"
+  fi
+fi
 
 # --- 5. fleet-state digest ---------------------------------------------
 section "FLEET STATE"
-print_file_or_absent "$DATA/backlog.md" "data/backlog.md"
 
-subsection "In-flight tasks (state/*.meta)"
+# The backlog's In-flight section is what a first turn acts on; Queued and Done
+# are context for later decisions, so they are reported as counts with the
+# command that lists them. The `## In flight` / `## Queued` / `## Done` headings
+# are a documented contract (AGENTS.md section 10), which is what makes this
+# split safe to compute here rather than guessing at structure.
+if print_file_header "$DATA/backlog.md" "data/backlog.md"; then
+  if print_whole "$DATA/backlog.md"; then
+    cat "$DATA/backlog.md"
+  else
+    summary_line "$DATA/backlog.md"
+    # Only column-zero list items are ITEMS; an indented dash is a note inside
+    # the item above it (the backlog's free-form note form), and counting those
+    # would both inflate the counts and drag note prose into the digest.
+    awk -v max="$LINE_MAX" -v cap="$INDEX_MAX" '
+      /^## / { sect = substr($0, 4); counts[sect] = 0; order[++n] = sect; next }
+      /^- / {
+        if (sect == "") next
+        counts[sect]++
+        if (sect == "In flight") {
+          line = $0
+          if (length(line) > max) line = substr(line, 1, max) " …"
+          inflight[++f] = line
+        }
+      }
+      END {
+        printf "Section counts:"
+        for (i = 1; i <= n; i++) printf " %s=%d", order[i], counts[order[i]]
+        printf "\n"
+        if (f > 0) {
+          print "In flight (the queue this turn acts on):"
+          for (i = 1; i <= f && i <= cap; i++) print "  " inflight[i]
+          if (f > cap) printf "  ... %d more in flight (capped at %d)\n", f - cap, cap
+        }
+      }
+    ' "$DATA/backlog.md"
+    pointer "backlog (queued, done, and item notes)" "cat $DATA/backlog.md"
+  fi
+fi
+
+# One line per task instead of the whole meta block plus a status tail. The line
+# carries every field a first turn actually branches on - kind, mode, backend
+# endpoint and its liveness, a recorded PR, and the last wake EVENT - and the
+# section prints the retrieval commands for everything else exactly once.
+subsection "In-flight tasks (one line per task)"
 META_FOUND=0
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   META_FOUND=1
   id=$(basename "$meta" .meta)
-  printf '\n--- %s ---\n' "$id"
-  cat "$meta"
-
+  kind=$(fm_meta_get "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  mode=$(fm_meta_get "$meta" mode)
+  pr=$(fm_meta_get "$meta" pr)
   window=$(fm_meta_get "$meta" window)
   target=$(fm_backend_target_of_meta "$meta")
   if [ -n "$window" ]; then
     backend=$(fm_backend_of_meta "$meta")
     if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
-      printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
+      endpoint="alive"
     else
-      printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
+      endpoint="dead"
     fi
+    endpoint="$backend $window endpoint=$endpoint"
   else
-    printf 'endpoint: unknown (no window recorded)\n'
+    endpoint="endpoint=unknown (no window recorded)"
   fi
-
-  status="$STATE/$id.status"
-  if [ -f "$status" ]; then
-    print_status_tail "$status"
-  else
-    printf 'status tail: (no status file yet: %s)\n' "$status"
-  fi
+  printf '%s · %s%s · %s%s · last: %s\n' \
+    "$id" "$kind" "${mode:+/$mode}" "$endpoint" "${pr:+ · pr=$pr}" \
+    "$(print_status_last "$STATE/$id.status")" | clip
+  print_status_extra "$STATE/$id.status"
 done
-[ "$META_FOUND" -eq 1 ] || printf '(none)\n'
+if [ "$META_FOUND" -eq 1 ]; then
+  printf '  -> full meta: cat %s/<id>.meta · full wake-event history: cat %s/<id>.status\n' "$STATE" "$STATE"
+  printf '  -> LIVE current state (not the event log): bin/fm-crew-state.sh <id> · whole fleet: bin/fm-fleet-view.sh\n'
+else
+  printf '(none)\n'
+fi
 
 subsection "Orphan status logs (state/*.status without matching .meta)"
 ORPHAN_STATUS_FOUND=0
@@ -274,8 +477,8 @@ for status in "$STATE"/*.status; do
   id=$(basename "$status" .status)
   [ -f "$STATE/$id.meta" ] && continue
   ORPHAN_STATUS_FOUND=1
-  printf '\n--- %s ---\n' "$id"
-  print_status_tail "$status"
+  printf '%s · last: %s\n' "$id" "$(print_status_last "$status")" | clip
+  print_status_extra "$status"
 done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
 
@@ -317,15 +520,24 @@ This script never starts supervision itself.
 EOF
 fi
 cat <<'EOF'
-The digest above is complete for this session start. Do NOT re-read
-data/projects.md, data/secondmates.md, data/captain.md, data/learnings.md,
-data/backlog.md, or state/*.meta now - they were just printed in full.
-Do NOT bulk-read state/*.status now either: their bounded tails were just
-printed with full log paths for targeted follow-up when older wake-event
-history is actually needed. Re-reading everything defeats the entire point
-of this command. Re-read a file only if this digest flagged it ABSENT (then
-rebuild or create it per AGENTS.md), its contents looked unparseable/corrupt,
-or an individual full status log is needed for older wake-event history.
+The digest above is complete for this session start. It is deliberately LEAN:
+large sections were summarized, and each one printed the exact command that
+retrieves its full content.
+
+Do NOT bulk-re-read those sources now. A blanket sweep of data/projects.md,
+data/secondmates.md, data/captain.md, data/learnings.md, data/backlog.md,
+state/*.meta, or state/*.status on this turn defeats the entire point of this
+command, and every byte you pull in is re-read as context on every later turn.
+
+DO make a targeted retrieval the moment you need one. Reading a summarized
+section on demand is EXPECTED, not a violation: run the printed pointer command
+for that one section when you are about to act on what it holds - the captain
+preference governing what you are writing, the learning covering the area you
+are touching, the queued backlog item you are dispatching, one task's full meta
+or wake-event history. Prefer bin/fm-crew-state.sh <id> over any status log when
+you want a crew's CURRENT state, and bin/fm-fleet-view.sh for the whole fleet.
+Re-read a whole file only when this digest flagged it ABSENT (then rebuild or
+create it per AGENTS.md) or its contents looked unparseable or corrupt.
 EOF
 
 exit 0
