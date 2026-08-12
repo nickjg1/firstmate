@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Record a PR-ready task: appends pr=<url> and GitHub's pr_head=<sha> to
-# state/<id>.meta when available, then arms the watcher's merge poll by writing
-# state/<id>.check.sh, which prints one line iff the PR is merged (the watcher's
-# check contract: output = wake firstmate, silence = keep sleeping).
+# Record a PR-ready task by atomically installing the watcher's merge poll before
+# recording pr=<url> and GitHub's pr_head=<sha> in state/<id>.meta when available.
+# The poll prints one line iff the PR is merged (output = wake firstmate, silence
+# = keep sleeping).
 # Usage: fm-pr-check.sh <task-id> <pr-url>
 set -eu
 
@@ -15,6 +15,15 @@ ID=$1
 URL=$2
 
 META="$STATE/$ID.meta"
+
+CHECK_TMP="$STATE/.$ID.check.sh.$$"
+trap 'rm -f "$CHECK_TMP"' EXIT
+cat > "$CHECK_TMP" <<EOF
+state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)
+[ "\$state" = "MERGED" ] && echo "merged"
+EOF
+mv -f "$CHECK_TMP" "$STATE/$ID.check.sh"
+
 if [ -f "$META" ]; then
   WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
   PR_HEAD=
@@ -32,9 +41,4 @@ if [ -f "$META" ]; then
     echo "pr_head=$PR_HEAD" >> "$META"
   fi
 fi
-
-cat > "$STATE/$ID.check.sh" <<EOF
-state=\$(gh pr view "$URL" --json state -q .state 2>/dev/null)
-[ "\$state" = "MERGED" ] && echo "merged"
-EOF
 echo "armed: state/$ID.check.sh polls $URL"

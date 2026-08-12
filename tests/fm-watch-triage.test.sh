@@ -227,9 +227,9 @@ test_crew_absorb_class_classifier() {
 # predicates. Both stem from run-step precedence being applied past the point it
 # is evidence: a TERMINAL run cannot resume, so it says nothing about what the
 # crew is doing now.
-#   - awaiting-merge: a done run plus a recorded pr= is a green PR firstmate
-#     already relayed and already armed a merge poll for, so its idle pane is not
-#     news. Without this the crew tripped a stale wake EVERY poll until teardown.
+#   - awaiting-merge: a done run plus a recorded pr= and an armed merge poll is a
+#     green PR firstmate already relayed and has a wake path for, so its idle pane
+#     is not news. Without this the crew tripped a stale wake EVERY poll until teardown.
 #   - terminal run + declared pause: a cancelled/failed run used to outrank the
 #     pause and return none, which defeated pause absorption entirely.
 test_crew_absorb_class_terminal_run_classifier() {
@@ -244,8 +244,11 @@ test_crew_absorb_class_terminal_run_classifier() {
   printf 'done: PR https://example.test/owner/repo/pull/9 checks green\n' > "$state/nopr.status"
 
   FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
+  [ "$(crew_absorb_class merged "$state")" = none ] \
+    || fail "a done run with pr= but no poll shim was classed awaiting-merge"
+  : > "$state/merged.check.sh"
   [ "$(crew_absorb_class merged "$state")" = awaiting-merge ] \
-    || fail "a done run with a recorded pr= was not classed awaiting-merge"
+    || fail "a done run with a recorded pr= and poll shim was not classed awaiting-merge"
   crew_is_awaiting_merge merged "$state" || fail "crew_is_awaiting_merge did not recognize the verdict"
   ! crew_is_provably_working merged "$state" || fail "an awaiting-merge crew must not count as provably working"
   [ "$(crew_absorb_class nopr "$state")" = none ] \
@@ -678,6 +681,7 @@ assert_awaiting_merge_absorbed() {  # <case> <window> <task> <last-status-line>
   printf 'PR open, waiting on the captain\n' > "$capture_file"
   fm_write_meta "$state/$task.meta" "window=$window" "kind=ship" \
     "pr=https://example.test/owner/repo/pull/42"
+  : > "$state/$task.check.sh"
   printf '%s\n' "$status_line" > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-${task}_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -751,7 +755,8 @@ fi
 SH
   chmod +x "$fakebin/fm-crew-state.sh"
   printf 'window=%s\nkind=ship\npr=https://example.test/owner/repo/pull/42\n' "$window" > "$state/$task.meta"
-  printf 'paused: awaiting captain merge decision\n' > "$state/$task.status"
+  printf 'done: PR https://example.test/owner/repo/pull/42 checks green\n' > "$state/$task.status"
+  : > "$state/$task.check.sh"
   sig=$(seen_sig "$state/$task.status"); printf '%s' "$sig" > "$state/.seen-${task}_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "PR open, waiting on the captain")
@@ -769,6 +774,8 @@ SH
   wait_for_exit "$pid" 40 || { reap "$pid"; fail "unchanged awaiting-merge hash never reclassified after the bounded window"; }
   grep -F "stale: $window" "$out" >/dev/null || fail "state transition did not surface a stale wake: $(cat "$out")"
   [ ! -e "$state/.awaiting-merge-$key" ] || fail "state transition retained the awaiting-merge marker"
+  [ "$(cat "$state/.hb-surfaced-$task" 2>/dev/null || true)" = "done: PR https://example.test/owner/repo/pull/42 checks green" ] \
+    || fail "state transition did not mark the surfaced status for heartbeat deduplication"
   pass "an unchanged awaiting-merge hash rechecks current state and surfaces after the bounded window"
 }
 
@@ -779,6 +786,7 @@ test_awaiting_merge_missing_status_rechecks() {
   printf 'PR open, waiting on the captain\n' > "$capture_file"
   fm_write_meta "$state/$task.meta" "window=$window" "kind=ship" \
     "pr=https://example.test/owner/repo/pull/42"
+  : > "$state/$task.check.sh"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "PR open, waiting on the captain")
   printf '%s' "$pane_hash" > "$state/.hash-$key"

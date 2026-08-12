@@ -136,7 +136,7 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
 # A crew whose run finished green on a PR firstmate already recorded (the
 # awaiting-merge absorb class, fm-classify-lib.sh) is parked, not wedged: the PR
-# was relayed and the merge poll is armed, so its idle pane is absorbed and only
+# was relayed and its merge poll exists, so its idle pane is absorbed and only
 # rechecked on this long bounded cadence.
 AWAITING_MERGE_RESURFACE_SECS=${FM_AWAITING_MERGE_RESURFACE_SECS:-$FM_AWAITING_MERGE_RESURFACE_SECS_DEFAULT}
 # Bounded re-escalation window for the push (native-event) path: an identical
@@ -388,11 +388,10 @@ handle_paused_stale() {  # <window> <task> <hash>
 # the highest-volume spurious wake in the fleet: before it, such a crew tripped a
 # `stale:` wake every poll from the moment its run went terminal until teardown -
 # every ~30-60s for hours across a whole day of unmerged PRs (data/learnings.md
-# 2026-07-22). Absorbing is safe rather than merely quiet: the pr= field only
-# exists because firstmate ran fm-pr-check.sh, which both proves the PR was
-# already relayed and arms the per-task merge poll that will wake firstmate the
-# moment it lands. The bounded recheck below is the anti-rot backstop for a PR
-# that simply sits unmerged.
+# 2026-07-22). Absorbing is safe rather than merely quiet: the task's pr= and
+# state/<id>.check.sh poll coexist only after fm-pr-check.sh relayed the PR and
+# armed the merge wake path. The bounded recheck below is the anti-rot backstop
+# for a PR that simply sits unmerged.
 handle_awaiting_merge_stale() {  # <window> <task> <hash>
   local win=$1 task=$2 h=$3 key recheck_file
   key=$(printf '%s' "$win" | tr ':/.' '___')
@@ -509,7 +508,7 @@ pause_state_class() {  # <window> <task>
 }
 
 surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key
+  local win=$1 h=$2 key task
   key=$(printf '%s' "$win" | tr ':/.' '___')
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
@@ -517,6 +516,8 @@ surface_nonterminal_stale() {  # <window> <hash>
         "$STATE/.paused-resurfaced-$key" "$STATE/.awaiting-merge-$key" \
         "$STATE/.awaiting-merge-rechecked-$key" "$STATE/.merge-resurfaced-$key" \
         "$STATE/.wedge-acked-$key" "$STATE/.idle-since-$key"
+  task=$(window_to_task "$win" "$STATE")
+  [ -n "$task" ] && mark_surfaced "$STATE/$task.status"
   wake "stale: $win"
 }
 

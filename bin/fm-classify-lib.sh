@@ -266,19 +266,18 @@ signal_reason_is_actionable() {  # <file> ...
   return 1
 }
 
-# 0 when <state>/<id>.meta records a non-empty pr=. That field is written ONLY by
-# bin/fm-pr-check.sh (and bin/fm-pr-merge.sh), which firstmate runs after a crew
-# reports its PR - so its presence is durable proof that firstmate has already
-# been told about this PR and has armed the per-task merge poll
-# (state/<id>.check.sh). That is what makes the awaiting-merge absorb below safe:
-# the news is already delivered and a real wake path for the merge already
-# exists, so repeating the crew's idle pane as a stale wake adds nothing.
+# 0 when <state>/<id>.meta records a non-empty pr= and the per-task merge poll
+# exists at state/<id>.check.sh. Both are required because the poll shim is the
+# durable wake path that makes the awaiting-merge absorb below safe: the news is
+# already delivered and a real wake path for the merge already exists, so
+# repeating the crew's idle pane as a stale wake adds nothing.
 task_pr_recorded() {  # <id> <state>
   local id=$1 state=$2 pr
   [ -n "$id" ] && [ -n "$state" ] || return 1
   [ -f "$state/$id.meta" ] || return 1
   pr=$(grep '^pr=' "$state/$id.meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-  [ -n "$pr" ]
+  [ -n "$pr" ] || return 1
+  [ -f "$state/$id.check.sh" ]
 }
 
 # Classify WHY an idle/stale crew MIGHT be safely absorbed instead of surfaced,

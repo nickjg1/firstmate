@@ -243,14 +243,13 @@ Load `harness-adapters` before any spawn, recovery, trust-dialog handling, harne
 ## 5. Recovery (run at every session start, after the session-start digest)
 
 You may have been restarted mid-flight.
-Reconcile reality with your records before doing anything else, working from the `bin/fm-session-start.sh` digest section 3 already produced - its lock step, wake-queue drain, and fleet-state digest ARE recovery's data-gathering; do not re-run it or bulk-read its inputs here:
+Reconcile reality with your records before doing anything else, using the `bin/fm-session-start.sh` digest and its printed retrieval pointers; section 3 owns that digest contract, so do not re-run it or bulk-read its inputs here:
 
 1. The digest's lock section already tells you whether this session acquired the lock or is operating read-only; act on that exactly as section 3 describes.
 2. The digest's wake-queue section already printed the drained records; keep them as the first work queue for this recovery turn.
-3. The digest's fleet-state section already printed `data/backlog.md`, `data/secondmates.md` (from the context section), every `state/*.meta`, and a bounded tail of every `state/*.status`.
-   Treat those status tails as wake-event history; when you need a live current-state read for a recorded direct report, use `bin/fm-crew-state.sh <id>` instead of inferring from the last status line.
-   If older wake-event history matters, read the individual full status log named in the digest instead of bulk-reading every status file.
-4. Use the `window=` values from the digest's `state/*.meta` entries as the live direct-report set, and read the digest's per-task `endpoint: alive|dead` line for each - that cheap check is already done; do not re-probe it yourself.
+3. Use the digest's inline task summaries and load-bearing queue records as the initial recovery view, then run the printed `cat <state>/<id>.meta`, `cat <state>/<id>.status`, or section pointer only for the repository, worktree, backlog, context, or older wake-event detail you need.
+   Treat inline status lines as wake-event history; when you need a live current-state read for a recorded direct report, use `bin/fm-crew-state.sh <id>` instead of inferring from the last status line.
+4. Use the `window=` values from the digest's per-task lines as the live direct-report set, and read its `endpoint=alive|dead` field for each - that cheap check is already done; do not re-probe it yourself.
    Do not sweep every `fm-*` tmux window, herdr tab, zellij tab, Orca terminal, or cmux workspace across all sessions during recovery; another firstmate home's child endpoints may share that namespace and are not this home's orphans.
 5. If the digest reports a recorded direct-report's endpoint as `dead` (or a meta has no `window=`), reconcile it through its meta as described below.
 6. For meta with no window, or an endpoint the digest reported dead, reconcile by kind.

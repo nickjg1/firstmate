@@ -20,10 +20,10 @@ Fresh stale panes use the same current-state read before trusting the status log
 `bin/fm-classify-lib.sh`'s `crew_absorb_class` is the single owner of which idle panes are expected, and it recognizes three absorb classes plus `none`.
 `working` is the active-run or busy-pane case above.
 `paused` is a declared external wait; it is also returned when the run-step verdict is TERMINAL and the status log declares a pause, because a run that has passed, failed, or been cancelled cannot resume and so is not evidence about what the crew is doing now - extending run-step precedence to a terminal run is what let a cancelled run defeat pause absorption entirely.
-`awaiting-merge` is a run that finished green on a PR the task meta records as `pr=`.
-That field is written only by `bin/fm-pr-check.sh` and `bin/fm-pr-merge.sh`, so its presence proves the first mate was already told about the PR and has already armed the per-task merge poll; repeating the crew's idle pane as a stale wake therefore carries no new information, and the merge poll remains the real wake path.
+`awaiting-merge` is a run that finished green on a PR whose task meta records a non-empty `pr=` and whose `state/<id>.check.sh` merge poll exists.
+`bin/fm-pr-check.sh` installs that poll atomically before recording `pr=`, so both fields together prove the firstmate was told about the PR and a real merge wake path exists; repeating the crew's idle pane as a stale wake therefore carries no new information.
 Before that class existed, such a crew tripped a stale wake every poll from the moment its run went terminal until teardown - measured at every 30 to 60 seconds for hours across a day of unmerged PRs, and the single largest source of spurious supervision wakes in the fleet.
-Both idle-absorb classes share one bounded recheck mechanism anchored on the crew's own status-file mtime, so a churny idle pane cannot reset the cadence, and a forgotten pause or an abandoned PR still re-surfaces once per window.
+Both idle-absorb classes share one bounded recheck mechanism anchored on the crew's own status-file mtime when readable and a durable first-seen timestamp otherwise, so a churny idle pane cannot reset the cadence, and a forgotten pause or an abandoned PR still re-surfaces once per window.
 
 Run-step precedence has one further limit, on the wedge timer rather than the absorb class.
 An active run keeps a crew classed `working` even behind a declared pause, which is correct for the signal path but left a pane whose agent had exited under a still-open run repeating the identical possible-wedge alarm with no way to acknowledge it.
