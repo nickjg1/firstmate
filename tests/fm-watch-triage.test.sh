@@ -292,6 +292,134 @@ test_crew_absorb_class_terminal_run_classifier() {
   pass "crew_absorb_class: only checks-passed is awaiting-merge; passed or ambiguous terminal runs surface"
 }
 
+# Regression for backlog fm-awaiting-merge-absorb-gap-a7. A crew parked on a
+# green PR is ONE situation, but bin/fm-crew-state.sh reports it with two
+# different lines depending on whether the ci step's log tail still shows a green
+# marker at the instant it is read - and that tail moves under the CI monitor.
+# The `status-log` shape used to class `none`, so the same untouched crew
+# flickered between absorbed and surfaced, and every `none` both woke firstmate
+# and wiped the re-surface throttle that bounds the recheck cadence.
+test_crew_absorb_class_ci_monitor_phrasings() {
+  local dir fakebin state
+  dir=$(make_case absorb-class-ci-monitor); fakebin="$dir/fakebin"; state="$dir/state"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE
+
+  fm_write_meta "$state/green.meta" "window=test:fm-green" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/42"
+  : > "$state/green.check.sh"
+  printf 'done: PR https://example.test/owner/repo/pull/42 checks green\n' > "$state/green.status"
+
+  FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+  [ "$(crew_absorb_class green "$state")" = awaiting-merge ] \
+    || fail "the run-step ci-monitor phrasing was not classed awaiting-merge"
+
+  FM_FAKE_CREW_STATE='state: done · source: status-log · PR https://example.test/owner/repo/pull/42 checks green · run still monitoring PR'
+  [ "$(crew_absorb_class green "$state")" = awaiting-merge ] \
+    || fail "the status-log ci-monitor phrasing was not classed awaiting-merge"
+
+  # The relaxation is scoped to this outcome only: a status-log verdict with no
+  # ci-ready phrasing still surfaces, and so does one with no recorded PR.
+  FM_FAKE_CREW_STATE='state: done · source: status-log · done: finished'
+  [ "$(crew_absorb_class green "$state")" = none ] \
+    || fail "an ordinary status-log done verdict was absorbed as awaiting-merge"
+  rm -f "$state/green.check.sh"
+  FM_FAKE_CREW_STATE='state: done · source: status-log · PR https://example.test/owner/repo/pull/42 checks green · run still monitoring PR'
+  [ "$(crew_absorb_class green "$state")" = none ] \
+    || fail "a ci-monitor verdict with no armed merge poll was absorbed"
+
+  unset FM_FAKE_CREW_STATE
+  pass "crew_absorb_class: both ci-monitor phrasings class awaiting-merge, and only with a recorded PR"
+}
+
+# The re-surface THROTTLE outlives one classification episode. Every path that
+# used to drop a window's awaiting-merge markers dropped .merge-resurfaced-<key>
+# with them, so a single flicker out of the class reset the hour-long cadence to
+# "never rechecked" and the next reclassification surfaced immediately.
+test_awaiting_merge_throttle_survives_class_flicker() {
+  local dir state fakebin window task key
+  dir=$(make_case awaiting-merge-throttle); state="$dir/state"; fakebin="$dir/fakebin"
+  window="test:fm-throttle"; task=throttle
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  fm_write_meta "$state/$task.meta" "window=$window" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/42"
+  : > "$state/$task.check.sh"
+  printf 'done: PR https://example.test/owner/repo/pull/42 checks green\n' > "$state/$task.status"
+  : > "$state/.awaiting-merge-$key"
+  date +%s > "$state/.awaiting-merge-rechecked-$key"
+  date +%s > "$state/.merge-resurfaced-$key"
+
+  # Drive the production clear paths in a subshell scoped to this state dir.
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    bash -c '. "$1"; clear_pause_tracking "$2"' _ "$WATCH" "$window" \
+    || fail "clear_pause_tracking failed"
+  [ ! -e "$state/.awaiting-merge-$key" ] \
+    || fail "clear_pause_tracking kept the awaiting-merge classification flag"
+  [ -e "$state/.merge-resurfaced-$key" ] \
+    || fail "clear_pause_tracking wiped the re-surface throttle while the PR is still recorded"
+
+  # Once the PR record is gone the absorb is no longer safe, so the throttle goes.
+  rm -f "$state/$task.check.sh"
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    bash -c '. "$1"; clear_pause_tracking "$2"' _ "$WATCH" "$window" \
+    || fail "clear_pause_tracking failed with no armed merge poll"
+  [ ! -e "$state/.merge-resurfaced-$key" ] \
+    || fail "the re-surface throttle outlived the recorded PR"
+  pass "the awaiting-merge re-surface throttle survives a class flicker but not a lost PR record"
+}
+
+# End-to-end: a crew parked on a recorded PR whose authoritative verdict flickers
+# between the two ci-monitor phrasings must stay absorbed for the whole cadence.
+# Before the fix each flicker to the status-log shape surfaced a stale wake and
+# reset the throttle, which is exactly the 4-7 minute re-surface loop reported.
+test_awaiting_merge_absorbs_across_verdict_flicker() {
+  local dir state fakebin out capture_file window task key pane_hash sig pid flip
+  dir=$(make_case awaiting-merge-flicker); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-flicker"; task=flicker; flip="$dir/flip"
+  printf 'PR open, waiting on the captain\n' > "$capture_file"
+  printf '0\n' > "$flip"
+  # Alternate the verdict on every read, the way the moving ci log tail does.
+  cat > "$fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+n=$(cat "$FM_TEST_FLIP" 2>/dev/null || echo 0)
+printf '%s\n' "$(( n + 1 ))" > "$FM_TEST_FLIP"
+if [ $(( n % 2 )) -eq 0 ]; then
+  printf '%s\n' 'state: done · source: run-step · checks green: PR ready for review (still monitoring for merge/close)'
+else
+  printf '%s\n' 'state: done · source: status-log · PR https://example.test/owner/repo/pull/42 checks green · run still monitoring PR'
+fi
+SH
+  chmod +x "$fakebin/fm-crew-state.sh"
+  fm_write_meta "$state/$task.meta" "window=$window" "kind=ship" \
+    "pr=https://example.test/owner/repo/pull/42"
+  : > "$state/$task.check.sh"
+  printf 'done: PR https://example.test/owner/repo/pull/42 checks green\n' > "$state/$task.status"
+  sig=$(seen_sig "$state/$task.status"); printf '%s' "$sig" > "$state/.seen-${task}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "PR open, waiting on the captain")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # STALE_ESCALATE_SECS=1 forces the bounded recheck to re-derive the class on
+  # nearly every poll, so the flicker is exercised many times over.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_TEST_FLIP="$flip" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=1 FM_AWAITING_MERGE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 60; then
+    fail "a flickering awaiting-merge verdict surfaced a stale wake: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "a flickering awaiting-merge verdict printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "a flickering awaiting-merge verdict enqueued a wake"; }
+  [ -e "$state/.awaiting-merge-$key" ] || { reap "$pid"; fail "the awaiting-merge flag was not held across the flicker"; }
+  reap "$pid"
+  [ "$(cat "$flip")" -gt 2 ] || fail "the verdict was never re-derived, so the flicker was not exercised"
+  pass "a crew whose ci-monitor verdict flickers stays absorbed for the full awaiting-merge cadence"
+}
+
 # signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY
 # task it references is provably working; if any crew has stopped, or no task can be
 # resolved, it surfaces. Files map to ids by stripping .status / .turn-ended.
@@ -1281,6 +1409,72 @@ SH
 
 # --- heartbeat: no-change absorbed, backstop surfaces a missed status --------
 
+# --- backend errors degrade to a skipped poll, never to a dead watcher -------
+# The watcher shells out to a backend CLI on every window every cycle. When that
+# backend stops answering - a stopped herdr server, a socket that went away, a
+# client that errors - each read must cost this window's poll and nothing more,
+# and a run of all-failed cycles must lengthen the loop's own sleep instead of
+# hammering a dead backend at full cadence. Nothing here may end the process.
+test_backend_read_failure_backs_off_without_exiting() {
+  local dir state fakebin out window task key pid streak
+  dir=$(make_case backend-error-backoff); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; window="test:fm-deadbackend"; task=deadbackend
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # A backend whose capture always fails, the way a dead server's client does.
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = "list-windows" ]; then
+  [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
+  exit 0
+fi
+echo "error: server not running" >&2
+exit 1
+SH
+  chmod +x "$fakebin/tmux"
+  fm_write_meta "$state/$task.meta" "window=$window" "kind=ship"
+  printf 'working: building\n' > "$state/$task.status"
+  printf '%s' "$(seen_sig "$state/$task.status")" > "$state/.seen-${task}_status"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BACKEND_ERROR_STREAK_MIN=1 FM_BACKEND_ERROR_BACKOFF_MAX=2 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_live "$pid" 60 || fail "a failing backend read ended the watcher: $(cat "$out")"
+  [ ! -s "$out" ] || { reap "$pid"; fail "a failing backend read printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "a failing backend read enqueued a wake"; }
+  [ -e "$state/.last-watcher-beat" ] || { reap "$pid"; fail "the liveness beacon stopped while the backend was failing"; }
+  streak=$(grep -c 'error streak' "$state/.watch-triage.log" 2>/dev/null || echo 0)
+  reap "$pid"
+  [ "$streak" -ge 2 ] || fail "consecutive backend failures were not counted toward the backoff (streak lines: $streak)"
+  pass "repeated backend read failures back the poll loop off and never end the watcher"
+}
+
+# poll_sleep is the one place the backoff curve lives: normal cadence until
+# BACKEND_ERROR_STREAK_MIN consecutive all-failed cycles, then doubling per
+# further failed cycle, capped, and 0 disables it outright.
+test_poll_sleep_backoff_curve() {
+  local dir state got
+  dir=$(make_case poll-sleep-curve); state="$dir/state"
+  measure() {  # <streak> <max> -> the sleep poll_sleep would take
+    FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_BACKEND_ERROR_STREAK_MIN=2 \
+      FM_BACKEND_ERROR_BACKOFF_MAX="$2" bash -c '
+        . "$1"
+        _backend_err_streak=$2
+        sleep() { printf "%s\n" "$1"; }
+        poll_sleep' _ "$WATCH" "$1"
+  }
+  got=$(measure 0 300); [ "$got" = 1 ] || fail "a healthy backend did not sleep POLL (got $got)"
+  got=$(measure 2 300); [ "$got" = 1 ] || fail "the backoff started before the tolerated streak (got $got)"
+  got=$(measure 3 300); [ "$got" = 2 ] || fail "the first backed-off cycle did not double POLL (got $got)"
+  got=$(measure 5 300); [ "$got" = 8 ] || fail "the backoff did not keep doubling (got $got)"
+  got=$(measure 20 10); [ "$got" = 10 ] || fail "the backoff was not capped at the maximum (got $got)"
+  got=$(measure 20 0);  [ "$got" = 1 ] || fail "FM_BACKEND_ERROR_BACKOFF_MAX=0 did not disable the backoff (got $got)"
+  pass "poll_sleep backs off only past the tolerated streak, doubles, caps, and can be disabled"
+}
+
+
 test_heartbeat_no_change_absorbed() {
   local dir state fakebin out pid
   dir=$(make_case heartbeat-absorb); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
@@ -1433,6 +1627,11 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_awaiting_merge_stale_absorbed_then_rechecked
 test_awaiting_merge_rechecks_unchanged_hash
 test_awaiting_merge_missing_status_rechecks
+test_crew_absorb_class_ci_monitor_phrasings
+test_awaiting_merge_throttle_survives_class_flicker
+test_awaiting_merge_absorbs_across_verdict_flicker
+test_backend_read_failure_backs_off_without_exiting
+test_poll_sleep_backoff_curve
 test_cancelled_run_declared_pause_absorbed
 test_wedge_acknowledged_by_declared_pause
 test_secondmate_paused_resurfaces_in_normal_mode

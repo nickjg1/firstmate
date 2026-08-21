@@ -75,6 +75,10 @@ Firstmate adds this skill's load instruction to firstmate-repo briefs by hand in
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
 - Run `bin/fm-lint.sh` before treating a script change as done; it is the single owner of the lint definition (file set, config, and pinned shellcheck version) that CI and the no-mistakes pre-push gate both invoke, and it refuses to run under any other shellcheck version.
 - Colocate tests with the existing pattern in `tests/`, name them `<subject>.test.sh`, and extend an existing script rather than inventing a new runner.
+- Never pipe a large capture into an early-exiting reader (`| grep -q`, `| head -1`): the reader closes the pipe and the producer is left writing into it.
+  Under a parent that ignores SIGPIPE - which every Node-based agent harness does, and which every process it spawns inherits - that write returns EPIPE and the producer prints a broken-pipe diagnostic instead of dying silently.
+  Capture first and test with `case`, a here-string, or a first-line helper.
+  This is how `bin/backends/herdr.sh` came to print `printf: write error: Broken pipe` from inside the watcher's supervision loop (`docs/herdr-backend.md`, incident 2026-08-21).
 - A backend-verification doc (`docs/*-backend.md`) records empirical facts, not assumptions.
 - Include the date, version, exact commands run, and exact output.
 - Write incidents the same way, as evidence, not narrative alone.

@@ -143,6 +143,21 @@ AWAITING_MERGE_RESURFACE_SECS=${FM_AWAITING_MERGE_RESURFACE_SECS:-$FM_AWAITING_M
 # blocked edge on the same pane with an unchanged status line inside this window
 # is the same news already delivered, so it is deduped rather than re-surfaced.
 PUSH_RESURFACE_SECS=${FM_PUSH_RESURFACE_SECS:-$STALE_ESCALATE_SECS}
+# Repeated backend errors must never end the watcher. A herdr server that stops
+# answering, a socket that goes away, or a capability probe that starts failing
+# makes every backend read in a cycle fail; before this the loop simply spun at
+# POLL forever, hammering a dead backend. The poll loop now counts CONSECUTIVE
+# cycles in which every recorded window's backend read failed and, past
+# BACKEND_ERROR_STREAK_MIN of them, doubles its own sleep per further failed
+# cycle up to BACKEND_ERROR_BACKOFF_MAX seconds. Any successful read resets the
+# streak, so recovery is immediate. Knobs: FM_BACKEND_ERROR_BACKOFF_MAX (cap,
+# default 300s; 0 disables the backoff entirely) and FM_BACKEND_ERROR_STREAK_MIN
+# (failed cycles tolerated at the normal cadence first, default 2). Both are in
+# docs/configuration.md's environment-variable list; the rationale is in
+# docs/architecture.md "Backend errors are a skipped poll, never a dead watcher".
+BACKEND_ERROR_BACKOFF_MAX=${FM_BACKEND_ERROR_BACKOFF_MAX:-300}
+BACKEND_ERROR_STREAK_MIN=${FM_BACKEND_ERROR_STREAK_MIN:-2}
+_backend_err_streak=0
 TRIAGE_LOG="$STATE/.watch-triage.log"
 TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
 # Consecutive event-path failures (fm_backend_wait_transition returning 2 -
@@ -466,9 +481,42 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" \
-        "$STATE/.awaiting-merge-$key" "$STATE/.awaiting-merge-rechecked-$key" \
-        "$STATE/.merge-resurfaced-$key"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  clear_awaiting_merge_tracking "$win"
+}
+
+# Drop a window's awaiting-merge CLASSIFICATION markers, but keep the re-surface
+# THROTTLE (.merge-resurfaced-<key>) for as long as the task's PR is still
+# recorded and its merge poll still armed.
+#
+# The throttle is what bounds an awaiting-merge recheck to one wake per
+# AWAITING_MERGE_RESURFACE_SECS (an hour by default). Its lifetime is the
+# RECORDED PR, not one classification episode - and every caller that used to
+# delete it treated the two as the same thing. They are not: a crew parked on a
+# green PR flickers out of the awaiting-merge class and back on its own, with no
+# change in its actual situation, because fm-crew-state.sh derives the class from
+# a moving ci-log tail (a redraw, a re-armed CI monitor, a `working` blip all do
+# it). Each flicker wiped the throttle, so the very next poll that reclassified
+# the crew as awaiting-merge saw "never rechecked", compared the hours-old status
+# mtime against the cadence, and surfaced again. That collapsed an hour-long
+# cadence to one wake every few minutes for the whole life of an unmerged PR
+# (backlog fm-awaiting-merge-absorb-gap-a7). Keeping the throttle across the
+# flicker is what makes the cadence hold, including across watcher restarts,
+# since it is a file mtime.
+#
+# It is dropped once task_pr_recorded no longer holds - the PR record or the
+# merge poll is gone, so the absorb is no longer safe and the next stale must be
+# free to surface immediately.
+clear_awaiting_merge_tracking() {  # <window>
+  local win=$1 key task
+  key=${win//:/_}
+  key=${key//\//_}
+  key=${key//./_}
+  rm -f "$STATE/.awaiting-merge-$key" "$STATE/.awaiting-merge-rechecked-$key"
+  task=$(window_to_task "$win" "$STATE")
+  if [ -z "$task" ] || ! task_pr_recorded "$task" "$STATE"; then
+    rm -f "$STATE/.merge-resurfaced-$key"
+  fi
 }
 
 pause_state_class() {  # <window> <task>
@@ -513,12 +561,29 @@ surface_nonterminal_stale() {  # <window> <hash>
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" \
-        "$STATE/.paused-resurfaced-$key" "$STATE/.awaiting-merge-$key" \
-        "$STATE/.awaiting-merge-rechecked-$key" "$STATE/.merge-resurfaced-$key" \
-        "$STATE/.wedge-acked-$key" "$STATE/.idle-since-$key"
+        "$STATE/.paused-resurfaced-$key" "$STATE/.wedge-acked-$key" "$STATE/.idle-since-$key"
+  clear_awaiting_merge_tracking "$win"
   task=$(window_to_task "$win" "$STATE")
   [ -n "$task" ] && mark_surfaced "$STATE/$task.status"
   wake "stale: $win"
+}
+
+# poll_sleep: the loop's own sleep, lengthened while the backend is failing.
+# Normal cadence is POLL. Past BACKEND_ERROR_STREAK_MIN consecutive all-failed
+# cycles the sleep doubles per further failed cycle, capped at
+# BACKEND_ERROR_BACKOFF_MAX. This is what turns a dead backend into a slow retry
+# instead of a hot loop - and, with the fail-closed reads around it, into a
+# skipped poll instead of a dead watcher.
+poll_sleep() {
+  local secs=$POLL over=$(( _backend_err_streak - BACKEND_ERROR_STREAK_MIN ))
+  if [ "$BACKEND_ERROR_BACKOFF_MAX" -gt 0 ] && [ "$over" -gt 0 ]; then
+    while [ "$over" -gt 0 ] && [ "$secs" -lt "$BACKEND_ERROR_BACKOFF_MAX" ]; do
+      secs=$(( secs * 2 ))
+      over=$(( over - 1 ))
+    done
+    [ "$secs" -gt "$BACKEND_ERROR_BACKOFF_MAX" ] && secs=$BACKEND_ERROR_BACKOFF_MAX
+  fi
+  sleep "$secs"
 }
 
 # Check and heartbeat cadence must survive actionable exits and restarts: the
@@ -648,7 +713,15 @@ event_wait_or_sleep() {
   done < <(recorded_windows)
 
   if [ "${#windows[@]}" -eq 0 ]; then
-    sleep "$POLL"
+    poll_sleep
+    return
+  fi
+
+  # While the backend is failing, do not open an event subscription to it at all:
+  # back off on the poll path and let the next successful read re-enable the
+  # fast path. A failing probe must cost a skipped poll, never the watcher.
+  if [ "$_backend_err_streak" -gt "$BACKEND_ERROR_STREAK_MIN" ]; then
+    poll_sleep
     return
   fi
 
@@ -656,7 +729,10 @@ event_wait_or_sleep() {
   # read); re-probed only when the backend/session key changes.
   if [ "$_event_cap_key" != "$first_backend:$first_session" ]; then
     _event_cap_key="$first_backend:$first_session"
-    if fm_backend_events_capable "$first_backend" "$first_session"; then
+    # Fail-closed and fail-QUIET: the probe shells out to the backend CLI, so a
+    # hung, crashed, or noisy client must degrade to the poll path rather than
+    # end the cycle or write diagnostics into the supervisor's wake output.
+    if fm_backend_events_capable "$first_backend" "$first_session" 2>/dev/null; then
       _event_cap_ok=1
     else
       _event_cap_ok=0
@@ -664,7 +740,7 @@ event_wait_or_sleep() {
     _event_cap_fails=0
   fi
   if [ "$_event_cap_ok" != 1 ]; then
-    sleep "$POLL"
+    poll_sleep
     return
   fi
 
@@ -681,7 +757,7 @@ event_wait_or_sleep() {
       # pure polling for the rest of this watcher process.
       _event_cap_fails=$((_event_cap_fails + 1))
       [ "$_event_cap_fails" -ge "$EVENT_CAP_FAIL_MAX" ] && _event_cap_ok=0
-      sleep "$POLL"
+      poll_sleep
       ;;
     *)
       # 1: a clean full-budget wait with no actionable edge - the reader already
@@ -781,6 +857,16 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
+# A broken pipe must never take the supervisor down. The watcher shells out to
+# backend CLIs constantly, and any early-exiting reader (a `grep -q`, a `head`,
+# a killed event reader) leaves a producer writing into a closed pipe. Ignoring
+# SIGPIPE here makes that a per-command error the fail-closed reads below
+# already handle, on every harness. Under a Node-based agent harness SIGPIPE is
+# ALREADY SIG_IGN and inherited by everything it spawns, so this only makes the
+# behavior uniform - it is not a new regime for the primary environment. The
+# EPIPE-prone pipes on the hot path were removed as well (bin/backends/herdr.sh);
+# this is the backstop for the ones nobody has found yet.
+trap '' PIPE
 trap 'fm_lock_release "$WATCH_LOCK"' EXIT
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
@@ -889,6 +975,8 @@ EOF
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct
   # stale hash is surfaced, absorbed, or timed toward escalation once (.stale-*
   # remembers the hash already classified).
+  cycle_reads=0
+  cycle_read_fails=0
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
@@ -902,7 +990,13 @@ EOF
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
-    tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
+    cycle_reads=$(( cycle_reads + 1 ))
+    if ! tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null); then
+      # A failed backend read is a SKIPPED poll for this window, never an exit.
+      # Counted so a backend that fails for every window backs the loop off.
+      cycle_read_fails=$(( cycle_read_fails + 1 ))
+      continue
+    fi
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
     hf="$STATE/.hash-$key"
@@ -1073,6 +1167,16 @@ EOF
       fi
     fi
   done < <(recorded_windows)
+
+  # Backend-error streak: a cycle counts as failed only when there WAS something
+  # to read and every read failed, so an empty fleet or one bad window never
+  # slows the loop. Any successful read resets it, so recovery is immediate.
+  if [ "$cycle_reads" -gt 0 ] && [ "$cycle_read_fails" -ge "$cycle_reads" ]; then
+    _backend_err_streak=$(( _backend_err_streak + 1 ))
+    triage_log "backend read failed for all $cycle_reads window(s); error streak $_backend_err_streak"
+  else
+    _backend_err_streak=0
+  fi
 
   # Heartbeat: the watcher runs a cheap fleet-scan at a regular cadence no matter
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive
