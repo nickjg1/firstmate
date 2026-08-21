@@ -713,7 +713,7 @@ printf 'guard-fired\n' >&2
 exit 2
 EOF
   chmod +x "$worktree_dir/bin/fm-turnend-guard.sh"
-  out=$(PLUGIN="$plugin" DIRECTORY="$wrong_dir" WORKTREE="$worktree_dir" node 2>&1 <<'EOF'
+  out=$(PLUGIN="$plugin" DIRECTORY="$wrong_dir" WORKTREE="$worktree_dir" node --no-warnings 2>&1 <<'EOF'
 import { pathToFileURL } from "node:url";
 
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -784,7 +784,7 @@ SH
 exit 0
 SH
   chmod +x "$repo/bin/fm-turnend-guard.sh" "$repo/bin/fm-arm-pretool-check.sh"
-  out=$(PLUGIN="$ext" FM_HOME="$home" FM_GUARD_LOG="$log" node --input-type=module 2>&1 <<'EOF'
+  out=$(PLUGIN="$ext" FM_HOME="$home" FM_GUARD_LOG="$log" node --no-warnings --input-type=module 2>&1 <<'EOF'
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -844,7 +844,7 @@ SH
 exit 0
 SH
   chmod +x "$repo/bin/fm-turnend-guard.sh" "$repo/bin/fm-arm-pretool-check.sh"
-  out=$(PLUGIN="$ext" FM_HOME="$home" node --input-type=module 2>&1 <<'EOF'
+  out=$(PLUGIN="$ext" FM_HOME="$home" node --no-warnings --input-type=module 2>&1 <<'EOF'
 import { pathToFileURL } from "node:url";
 
 const handlers = new Map();
