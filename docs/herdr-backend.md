@@ -791,6 +791,67 @@ On entry the launcher drops the prior session's artifacts when the daemon is not
 This never drops a genuinely-pending escalation: the durable record is `state/.wake-queue` plus each crew's `state/<id>.status`, and any still-true condition is re-escalated by the daemon's heartbeat catch-all scan.
 Covered by the unit cases in `tests/fm-afk-launch.test.sh` (clear-on-fresh-entry vs refresh, and the stop ordering asserting the daemon saw `state/.afk` present at SIGTERM).
 
+## Incident (2026-08-21): broken-pipe diagnostics from the capability probe inside the watcher loop
+
+The main firstmate home's `bin/fm-watch-arm.sh` background task repeatedly ended with its last output being:
+
+```
+bin/backends/herdr.sh: line 1123: printf: write error: Broken pipe
+bin/backends/herdr.sh: line 1124: printf: write error: Broken pipe
+```
+
+Lines 1123-1124 were `fm_backend_herdr_events_capable`'s two needle tests:
+
+```sh
+printf '%s' "$schema" | grep -Fq 'events.subscribe' || return 1
+printf '%s' "$schema" | grep -Fq 'pane.agent_status_changed' || return 1
+```
+
+`herdr api schema --json` is roughly 220KB, and `grep -q` exits the instant it matches, so `printf` was left writing into a closed pipe.
+
+**The disposition is what decides whether that is silent or noisy, and the agent harness sets it.**
+Verified on macOS (Darwin 25.5.0), GNU bash 5.3.9(1)-release (aarch64-apple-darwin25.3.0).
+Inside a Claude Code Bash tool invocation:
+
+```
+$ python3 -c "import signal; print(signal.getsignal(signal.SIGPIPE))"
+1
+```
+
+`1` is `signal.SIG_IGN`: the Node runtime ignores SIGPIPE and every process it spawns inherits that disposition, including `fm-watch-arm.sh` and the `fm-watch.sh` it starts.
+Bash cannot reset a signal that was already ignored when it started, so the pipeline's `printf` gets `EPIPE` from `write()` instead of dying to SIGPIPE, and reports it.
+Reproduced exactly, both directions, over a multi-line payload whose needle is on an early line:
+
+```
+$ printf '%s' "$big" | grep -Fq events.subscribe; echo "PIPESTATUS0=${PIPESTATUS[0]}"
+PIPESTATUS0=141                                  # SIGPIPE default: subshell dies silently
+
+$ bash -c 'trap "" PIPE; source ep.sh'
+ep.sh: line 2: printf: write error: Broken pipe   # SIGPIPE ignored: EPIPE, and a diagnostic
+PIPESTATUS0=1
+```
+
+**The broken pipe was noise, not the terminator.**
+A pipeline's exit status is the LAST command's, so `grep`'s `0` was still what `|| return 1` saw: the probe kept returning the correct verdict, and neither `fm-watch.sh` nor `herdr.sh` sets `set -e` or `pipefail`.
+A script exercising the identical shape under `trap '' PIPE` prints the diagnostic on every iteration and runs to completion:
+
+```
+$ python3 -c "import signal,subprocess; signal.signal(signal.SIGPIPE, signal.SIG_IGN); subprocess.run(['bash','t2.sh'], restore_signals=False)"
+t2.sh: line 4: printf: write error: Broken pipe
+probe fail 0
+...
+survived
+rc= 0
+```
+
+So these lines were simply the last thing the arm's *stderr* carried before the background task ended: the watcher's stdout goes to the arm's temp file and is printed only on a clean wake exit, while stderr passes straight through to the harness.
+An unrelated termination therefore always shows the probe's diagnostic as its final output, which is what made the two look causally linked.
+
+**Fix.** `fm_backend_herdr_events_capable` now tests the captured schema with `case`, and `fm_backend_herdr_first_line` replaces every `| head -1` on herdr output (`fm_backend_herdr_socket_path`, the workspace/tab/pane id lookups); the bare-prompt classifier uses a here-string instead of `printf | grep -qE`.
+Regression coverage runs the probe under `trap '' PIPE` over a large multi-line schema and requires empty stderr (`tests/fm-backend-herdr.test.sh:test_events_capable_probe_emits_no_broken_pipe_under_ignored_sigpipe`).
+Confirmed red against the pre-fix probe with the exact reported message, green against the fix.
+Independently, `bin/fm-watch.sh` now ignores SIGPIPE outright and treats a failed backend read as a skipped poll with a bounded backoff, so no dead pipe or failing probe can end a watcher (`docs/architecture.md`, "Backend errors are a skipped poll, never a dead watcher").
+
 ## Known gaps and follow-up notes
 
 - **RESOLVED: worktree-discovery isolation guard's symlinked-project-prefix false refusal.** Originally discovered while building the runtime-backend-auto-detection real smoke test (`tests/fm-backend-autodetect-smoke.test.sh`), which needed a scratch project.

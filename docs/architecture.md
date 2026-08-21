@@ -25,6 +25,24 @@ Fresh stale panes use the same current-state read before trusting the status log
 Before that class existed, such a crew tripped a stale wake every poll from the moment its run went terminal until teardown - measured at every 30 to 60 seconds for hours across a day of unmerged PRs, and the single largest source of spurious supervision wakes in the fleet.
 Both idle-absorb classes share one bounded recheck mechanism anchored on the crew's own status-file mtime when readable and a durable first-seen timestamp otherwise, so a churny idle pane cannot reset the cadence, and a forgotten pause or an abandoned PR still re-surfaces once per window.
 
+The awaiting-merge re-surface throttle is owned by the recorded PR, not by one classification episode.
+A parked crew's class is derived from `bin/fm-crew-state.sh`, which reads a moving ci-log tail, so the same untouched crew flickers out of `awaiting-merge` and back on its own.
+Every path that dropped a window's awaiting-merge markers used to drop that throttle with them, so the next reclassification saw "never rechecked" and re-surfaced immediately - collapsing the hour-long cadence to one wake every few minutes for the whole life of an unmerged PR.
+The throttle now survives a class flicker and is dropped only when the PR record or its merge poll is gone, which is also what makes the cadence hold across watcher restarts, since it is a file mtime.
+Both phrasings `fm-crew-state.sh` uses for a CI-green run that is still monitoring its PR map to the same `checks-passed` outcome, so the flicker mostly stops happening in the first place.
+
+## Backend errors are a skipped poll, never a dead watcher
+
+The watcher shells out to a backend CLI for every recorded window on every cycle, so a backend that stops answering makes every read in a cycle fail.
+Each failed read costs that window's poll and nothing else.
+Consecutive cycles in which there was something to read and every read failed are counted; past `FM_BACKEND_ERROR_STREAK_MIN` of them the watcher doubles its own sleep per further failed cycle, capped at `FM_BACKEND_ERROR_BACKOFF_MAX` seconds, and stops opening event subscriptions to that backend.
+Any successful read resets the streak, so recovery is immediate, and the liveness beacon keeps ticking throughout.
+Setting `FM_BACKEND_ERROR_BACKOFF_MAX=0` disables the backoff without disabling the fail-closed reads.
+
+The reads themselves are hardened against the failure mode that produced the diagnostics: a reader that exits early (`grep -q`, `head`) leaves the producer writing into a closed pipe, and under a parent that ignores SIGPIPE - which every Node-based agent harness does, and which every process it spawns inherits - that write returns EPIPE and the producer prints a broken-pipe diagnostic from inside the supervision loop.
+`bin/backends/herdr.sh` no longer pipes herdr output into an early-exiting reader anywhere: the capability probe tests its captured schema with `case`, and `fm_backend_herdr_first_line` replaces every `| head -1`.
+The watcher also ignores SIGPIPE outright, so a broken pipe anywhere in the loop is a per-command error its fail-closed reads already handle rather than anything that can end the process.
+
 Run-step precedence has one further limit, on the wedge timer rather than the absorb class.
 An active run keeps a crew classed `working` even behind a declared pause, which is correct for the signal path but left a pane whose agent had exited under a still-open run repeating the identical possible-wedge alarm with no way to acknowledge it.
 Once the alarm has fired past `FM_WEDGE_DEMAND_INSPECT_COUNT` and a pause is declared, the supervisor has demonstrably both seen the alarm and declared the wait, so the escalation de-escalates to the bounded pause recheck instead of repeating; the escalation count resets wherever the pane becomes active again.

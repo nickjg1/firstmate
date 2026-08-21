@@ -1821,6 +1821,70 @@ test_apply_transition_defer_and_fallback_are_noops() {
   pass "fm_backend_herdr_apply_transition: idle/done (defer) and unknown/empty (fallback) take no fast action"
 }
 
+# --- the capability probe must never write to a pipe it can break ------------
+# `herdr api schema` is ~220KB. The probe used to test it with
+# `printf '%s' "$schema" | grep -Fq <needle>`, and `grep -q` exits the instant it
+# matches, leaving printf writing into a closed pipe. Under a parent that ignores
+# SIGPIPE - which every Node-based agent harness does, and which every process it
+# spawns inherits - that write returns EPIPE instead of killing the subshell, and
+# bash prints "printf: write error: Broken pipe". The watcher runs this probe
+# inside its supervision loop, so the noise landed in the supervisor's own
+# output. Run the probe with SIGPIPE ignored (`trap '' PIPE`, exactly the
+# inherited disposition) over a schema large enough to exceed the pipe buffer,
+# and require a clean verdict with EMPTY stderr.
+test_events_capable_probe_emits_no_broken_pipe_under_ignored_sigpipe() {
+  local dir fb err rc
+  dir="$TMP_ROOT/events-capable-epipe"; mkdir -p "$dir"
+  fb="$dir/fakebin"; mkdir -p "$fb"
+  # A herdr whose `api schema` is a big document with both needles near the very
+  # front, so an early-exiting reader is guaranteed to close the pipe mid-write.
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-} ${2:-}" in
+  "status --json") printf '{"client":{"protocol":99}}\n' ;;
+  "api schema")
+    # Pretty-printed, like the real client's --json: both needles on early
+    # LINES, then enough bulk to exceed the pipe buffer many times over. An
+    # early-exiting reader matches on line 2 and closes the pipe with most of
+    # the document still unwritten.
+    printf '{\n  "methods": [\n'
+    printf '    "events.subscribe",\n'
+    printf '    "pane.agent_status_changed",\n'
+    i=0
+    while [ "$i" -lt 40000 ]; do printf '    "filler.method.%s",\n' "$i"; i=$(( i + 1 )); done
+    printf '    "filler.last"\n  ]\n}\n'
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fb/herdr"
+  err="$dir/stderr"
+  rc=$(PATH="$fb:$PATH" bash -c '
+    trap "" PIPE
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_events_capable sess
+    echo $?' "$ROOT" 2>"$err" | tail -1)
+  [ "$rc" = 0 ] || fail "the capability probe rejected a fully capable schema, got rc=$rc: $(cat "$err")"
+  [ ! -s "$err" ] || fail "the capability probe wrote to stderr under an ignored SIGPIPE: $(cat "$err")"
+  pass "fm_backend_herdr_events_capable: no broken-pipe diagnostics under an ignored SIGPIPE"
+}
+
+# The same hazard in the other direction: `... | head -1` closes the pipe on the
+# producer. fm_backend_herdr_first_line replaces every such pipe, so assert the
+# helper itself is correct - first line only, empty in, empty out.
+test_first_line_helper_replaces_head() {
+  local out
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_first_line "$1"' "$ROOT" \
+    "$(printf 'one\ntwo\nthree')")
+  [ "$out" = one ] || fail "fm_backend_herdr_first_line did not return the first line, got '$out'"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_first_line "$1"' "$ROOT" "only")
+  [ "$out" = only ] || fail "fm_backend_herdr_first_line mangled a single-line value, got '$out'"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_first_line ""' "$ROOT")
+  [ -z "$out" ] || fail "fm_backend_herdr_first_line invented output for empty input, got '$out'"
+  pass "fm_backend_herdr_first_line: first line only, no pipe to break"
+}
+
 test_wait_transition_no_panes_returns_2() {
   local rc
   bash -c '. "$0/bin/backends/herdr.sh"; FM_BACKEND_HERDR_EVENTS_FORCE=1 fm_backend_herdr_wait_transition default 1 /tmp/st' "$ROOT"; rc=$?
@@ -2058,6 +2122,8 @@ test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
+test_events_capable_probe_emits_no_broken_pipe_under_ignored_sigpipe
+test_first_line_helper_replaces_head
 test_wait_transition_no_panes_returns_2
 test_wait_transition_not_capable_returns_2
 test_wait_transition_reconcile_blocked_returns_record

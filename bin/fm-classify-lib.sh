@@ -155,9 +155,17 @@ map_log_state() {  # <status-line> -> working|parked|blocked|paused|done|failed|
   esac
 }
 
+# The two checks-passed phrasings are the two ways bin/fm-crew-state.sh reports
+# THE SAME situation - a run that reached CI-green and is now only monitoring the
+# PR until it merges or closes. Which one it emits depends on whether the ci
+# step's own log tail still shows a green marker at that instant, which moves as
+# the CI monitor writes to it. Both must map to checks-passed, or the crew's
+# class flickers with the log tail while nothing about the crew has changed
+# (backlog fm-awaiting-merge-absorb-gap-a7).
 terminal_outcome() {  # <state/detail line> -> checks-passed|passed|unknown
   case "$1" in
     *"checks green: PR ready for review"*) printf 'checks-passed' ;;
+    *"run still monitoring PR"*) printf 'checks-passed' ;;
     *"run passed: PR merged/closed"*) printf 'passed' ;;
     *) printf 'unknown' ;;
   esac
@@ -328,8 +336,17 @@ crew_absorb_class() {  # <id> [<state>]
     done|failed)
       src=${line#*source: }; src=${src%% *}
       outcome=$(terminal_outcome "$line")
-      if [ "$crew_state" = "done" ] && [ "$src" = run-step ] \
-        && [ "$outcome" = checks-passed ] && task_pr_recorded "$id" "$state"; then
+      # `status-log` is accepted here alongside `run-step` for this one outcome
+      # only. fm-crew-state.sh emits done/status-log for a CI-green run when it
+      # has ALREADY reconciled an active run against a ci-ready status line, so
+      # it is a reconciled verdict, not the stale-log read the run-step
+      # requirement exists to reject. Requiring run-step made the same parked
+      # crew classify awaiting-merge or none depending on which side of that
+      # reconciliation fm-crew-state.sh happened to land on, and every `none`
+      # surfaced a stale wake for a PR firstmate had already relayed.
+      if [ "$crew_state" = "done" ] && [ "$outcome" = checks-passed ] \
+        && { [ "$src" = run-step ] || [ "$src" = status-log ]; } \
+        && task_pr_recorded "$id" "$state"; then
         printf 'awaiting-merge'; return
       fi
       if [ "$crew_state" = "done" ] && [ "$src" = run-step ] && [ "$outcome" = passed ]; then
