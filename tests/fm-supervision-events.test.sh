@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tests/fm-supervision-events.test.sh - unit tests for the watcher's native
-# event-wait splice (event_wait_or_sleep, handle_push_transition in
-# bin/fm-watch.sh). The watcher's source guard lets this file source it to load
+# event-wait splice (event_wait_or_sleep in bin/fm-watch.sh and
+# handle_push_transition in bin/fm-push-transition-lib.sh). The watcher's source
+# guard lets this file source it to load
 # the functions WITHOUT acquiring the singleton lock or entering the blocking
 # loop; wake/sleep and the backend dispatchers are overridden so the exemptions,
 # capability memo, and fail-closed disable are asserted deterministically with no
@@ -19,7 +20,9 @@ mkdir -p "$STATE_DIR"
 # lock/loop, so only the functions load.
 export FM_STATE_OVERRIDE="$STATE_DIR"
 export FM_ROOT_OVERRIDE="$ROOT"
-# shellcheck source=bin/fm-watch.sh
+# Production modules are independently linted canonical roots. Keep this test's
+# ShellCheck context local while preserving its unchanged runtime source path.
+# shellcheck source=/dev/null
 . "$ROOT/bin/fm-watch.sh"
 
 # Overrides: capture wake reasons and neutralize real sleeps (POLL is 15s).
@@ -31,8 +34,7 @@ sleep() { printf 'SLEEP\n' >> "$SLEEP_LOG"; }
 reset_state() {
   rm -f "$STATE_DIR"/*.meta "$STATE_DIR"/*.status "$STATE_DIR"/.wake-queue \
     "$STATE_DIR"/.wake-queue.seq "$STATE_DIR"/.watch-triage.log \
-    "$STATE_DIR"/.herdr-escalated-* "$STATE_DIR"/.push-escalated-* \
-    "$STATE_DIR"/.hb-surfaced-* "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled 2>/dev/null || true
+    "$STATE_DIR"/.herdr-escalated-* "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled 2>/dev/null || true
   : > "$WAKE_LOG"
   : > "$SLEEP_LOG"
   _event_cap_key=""
@@ -60,6 +62,7 @@ pass "handle_push_transition: a blocked crew enqueues a stale wake naming its wi
 reset_state
 fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
 (
+  # shellcheck disable=SC2329 # Runtime override called by the isolated production owner.
   fm_wake_append() { return 1; }
   handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
 ) >/dev/null 2>&1 || true
@@ -79,65 +82,27 @@ fi
 grep -q 'absorbed push' "$STATE_DIR/.watch-triage.log" 2>/dev/null || fail "the paused absorb should be logged to the triage log"
 pass "handle_push_transition: a declared-pause crew is absorbed (no fast wake), left to the poll loop's long cadence"
 
-# --- handle_push_transition: classify BEFORE escalating ----------------------
-# Regression for the recurring herdr re-escalation (data/learnings.md 2026-08-03;
-# backlog fm-pause-vs-cancelled-run-c2). A crew parked at a no-mistakes gate
-# flickers working<->blocked as its TUI redraws, and each `working` edge clears
-# the backend's own dedupe marker, so the SAME already-relayed gate re-escalated
-# on every watcher cycle - one full supervisor turn each, for as long as the gate
-# stayed open. The fix is classification, not suppression: a blocked edge whose
-# captain-relevant status line is already recorded as SURFACED is news firstmate
-# demonstrably already has.
+# --- handle_push_transition: absorb for a verified captain-held transfer -------
 
 reset_state
-fm_write_meta "$STATE_DIR/tk5.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
-printf 'needs-decision: pick A or B\n' > "$STATE_DIR/tk5.status"
+fm_write_meta "$STATE_DIR/tk2h.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+printf 'captain-held [key=route]: tracked by task-decision-route\n' > "$STATE_DIR/tk2h.status"
 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
-[ -s "$WAKE_LOG" ] || fail "the FIRST blocked edge for an unsurfaced needs-decision must still wake the supervisor"
-[ -s "$STATE_DIR/.hb-surfaced-tk5" ] || fail "the first escalation must record the surfaced marker"
-# The gate is unchanged and already surfaced; a `working` edge cleared the
-# backend marker, so the next blocked edge reaches this handler again.
-rm -f "$STATE_DIR/.herdr-escalated-default_wG_pQ"
-: > "$WAKE_LOG"
-: > "$STATE_DIR/.wake-queue"
-handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
-[ ! -s "$WAKE_LOG" ] || fail "a repeat blocked edge on an ALREADY-SURFACED gate must not wake the supervisor again"
-[ ! -s "$STATE_DIR/.wake-queue" ] || fail "a repeat blocked edge on an already-surfaced gate must not enqueue"
-grep -q 'already surfaced' "$STATE_DIR/.watch-triage.log" || fail "the already-surfaced absorb should name its reason in the triage log"
-# A genuinely NEW gate on the same pane must still escalate at once.
-printf 'needs-decision: now also pick C or D\n' >> "$STATE_DIR/tk5.status"
-rm -f "$STATE_DIR/.herdr-escalated-default_wG_pQ"
-handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
-[ -s "$WAKE_LOG" ] || fail "a NEW gate on the same pane must still escalate immediately"
-pass "handle_push_transition: an already-surfaced gate is absorbed on repeat blocked edges, a new one still escalates"
-
-# A blocked crew that wrote NO status (a trust dialog, an interactive menu) has
-# no surfaced marker to compare against, so it is deduped on the identical
-# <to_status, status-line> signature within FM_PUSH_RESURFACE_SECS instead.
-reset_state
-fm_write_meta "$STATE_DIR/tk6.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
-handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
-[ -s "$WAKE_LOG" ] || fail "a first statusless blocked edge must wake the supervisor"
-[ -e "$STATE_DIR/.push-escalated-default_wG_pQ" ] || fail "an escalation must record its push signature"
-rm -f "$STATE_DIR/.herdr-escalated-default_wG_pQ"
-: > "$WAKE_LOG"
-: > "$STATE_DIR/.wake-queue"
-handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
-[ ! -s "$WAKE_LOG" ] || fail "an unchanged statusless blocked edge inside the window must not re-wake"
-grep -q 'unchanged repeat' "$STATE_DIR/.watch-triage.log" || fail "the unchanged-repeat absorb should name its reason"
-# Past the window, the same pane may report again so a real wedge cannot rot.
-rm -f "$STATE_DIR/.herdr-escalated-default_wG_pQ"
-: > "$WAKE_LOG"
-FM_PUSH_RESURFACE_SECS=0 PUSH_RESURFACE_SECS=0 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
-[ -s "$WAKE_LOG" ] || fail "past PUSH_RESURFACE_SECS an unchanged blocked edge must report again"
-pass "handle_push_transition: an unchanged statusless blocked edge is deduped inside the window and reports again past it"
+if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; then
+  fail "a captain-held crew must NOT be fast-escalated: $(cat "$STATE_DIR/.wake-queue")"
+fi
+[ ! -s "$WAKE_LOG" ] || fail "a captain-held crew must not wake the supervisor from the event fast-path"
+grep -q 'absorbed push' "$STATE_DIR/.watch-triage.log" 2>/dev/null || fail "the captain-held absorb should be logged to the triage log"
+pass "handle_push_transition: a captain-held crew is absorbed (no fast wake), left to the poll loop's long cadence"
 
 # --- event_wait_or_sleep: secondmate windows are excluded from the pane list --
 
 reset_state
 fm_write_meta "$STATE_DIR/tk3.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
 fm_write_meta "$STATE_DIR/sm1.meta" "window=default:wA:pS" "backend=herdr" "kind=secondmate"
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
 fm_backend_events_capable() { return 0; }
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
 fm_backend_wait_transition() { shift 4; printf '%s\n' "$*" > "$TMP/panes"; return 1; }
 event_wait_or_sleep
 PANES=$(cat "$TMP/panes" 2>/dev/null || true)
@@ -148,7 +113,9 @@ pass "event_wait_or_sleep: herdr windows go on the event pane list, but kind=sec
 reset_state
 fm_write_meta "$STATE_DIR/tk3.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
 CAP_CALLS=0
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
 fm_backend_events_capable() { CAP_CALLS=$((CAP_CALLS + 1)); return 0; }
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
 fm_backend_wait_transition() {
   [ "${FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED:-0}" = 1 ] || fail "cached capability verdict was not passed to the wait"
   return 1
@@ -162,6 +129,7 @@ pass "event_wait_or_sleep: one cached capability probe owns validation across bo
 
 reset_state
 fm_write_meta "$STATE_DIR/tk4.meta" "window=fmses:fm-tk4" "kind=ship"   # no backend= -> tmux
+# shellcheck disable=SC2329 # Runtime override called by the isolated watcher.
 fm_backend_wait_transition() { printf 'CALLED\n' > "$TMP/wtcalled"; return 1; }
 event_wait_or_sleep
 [ ! -e "$TMP/wtcalled" ] || fail "a tmux-only home must never invoke the event wait path"
@@ -172,8 +140,10 @@ pass "event_wait_or_sleep: a home with no push-capable window is inert (sleeps P
 
 reset_state
 fm_write_meta "$STATE_DIR/tk5.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
-EVENT_CAP_FAIL_MAX=2
+export EVENT_CAP_FAIL_MAX=2
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
 fm_backend_events_capable() { return 0; }
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
 fm_backend_wait_transition() { printf 'WT\n' >> "$TMP/wtcalls"; return 2; }
 : > "$TMP/wtcalls"
 event_wait_or_sleep   # fails=1
