@@ -379,20 +379,24 @@ test_no_mistakes_dod_wording() {
 # escalation path entirely. Both belong in the scaffold, which is their one
 # owner; AGENTS.md only cross-references them.
 test_decision_cost_contract() {
-  local home brief
+  local home brief id_mode id mode
   home="$TMP_ROOT/decision-cost-home"
   write_registry "$home"
 
-  for id_proj in "brief-cost-d1:no-registry-proj" "brief-cost-d2:direct-proj" "brief-cost-d3:local-proj"; do
-    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "${id_proj%%:*}" "${id_proj##*:}" >/dev/null 2>&1
-    brief="$home/data/${id_proj%%:*}/brief.md"
-    assert_present "$brief" "${id_proj%%:*}: brief was not scaffolded"
+  # Every ship mode carries the rule, so --mode (required since the ship scaffold
+  # stopped inferring it) is varied across the three concrete delivery modes.
+  for id_mode in "brief-cost-d1:no-mistakes" "brief-cost-d2:direct-PR" "brief-cost-d3:local-only"; do
+    id=${id_mode%%:*}
+    mode=${id_mode##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$id: brief was not scaffolded"
     assert_grep "Batch your questions" "$brief" \
-      "${id_proj%%:*}: ship brief lost the decision-batching rule"
+      "$id: ship brief lost the decision-batching rule"
     assert_grep "numbered \`needs-decision\` line" "$brief" \
-      "${id_proj%%:*}: ship brief lost the one-line batching instruction"
+      "$id: ship brief lost the one-line batching instruction"
     assert_grep "Never serialize one question per append" "$brief" \
-      "${id_proj%%:*}: ship brief lost the do-not-serialize instruction"
+      "$id: ship brief lost the do-not-serialize instruction"
   done
 
   # Scouts escalate through the same rule 6, so they carry it too.

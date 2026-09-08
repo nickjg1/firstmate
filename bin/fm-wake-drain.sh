@@ -6,6 +6,11 @@
 # newer branch outcome, OPEN DECISIONS, and captain-call record divergence,
 # then assert liveness.
 #
+# The durable records print first and unchanged - they are the lossless log.
+# A WAKE BRIEF then renders one compact actionable line per record
+# (bin/fm-wake-brief.sh); FM_WAKE_BRIEF=0 prints records only, and a brief
+# failure never changes the drain's exit status.
+#
 # Keep sequence-bound row consumption independent from generation-bound episode
 # retirement; docs/watcher-continuity.md owns the recovery contract.
 # FM_STATUS_PRESENTATION_LOCK_TIMEOUT sets the positive whole-second wait for
@@ -208,6 +213,25 @@ case "${1:-}" in
 esac
 
 [ "$ACTOR" != branch ] || require_branch_eligible_rows || exit 1
+
+# One compact actionable line per presented record (bin/fm-wake-brief.sh),
+# folding in the reads a supervisor otherwise makes by hand for every wake: the
+# status file, the task metadata, and the crew's current state. The durable
+# records above stay the lossless log and every existing consumer keeps reading
+# them; this block is the one-read handling path, so reach for
+# bin/fm-crew-state.sh, bin/fm-peek.sh, or bin/fm-fleet-view.sh only when a brief
+# line says to. FM_WAKE_BRIEF=0 prints records only. Runs after the queue lock is
+# released, because briefing shells out per task and holding the lock across that
+# would stall the watcher's own append; a brief failure never changes the drain's
+# exit status.
+print_wake_brief() {  # <raw-rows>
+  local rows=$1
+  [ -n "$rows" ] || return 0
+  [ "${FM_WAKE_BRIEF:-1}" != 0 ] || return 0
+  printf -- '--- wake brief (one line per wake; act from these) ---\n' || return 0
+  printf '%s\n' "$rows" | "$SCRIPT_DIR/fm-wake-brief.sh" || true
+  printf -- '--- end wake brief ---\n' || return 0
+}
 
 # Defense in depth for the supervision chain: this script runs at the top of
 # every wake-handling and recovery turn, so assert supervision health here too. A
@@ -860,6 +884,7 @@ DRAIN_LOCK_HELD=false
 printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through %s --recovery-generation %s\n' \
   "$ACK_THROUGH" "${RECOVERY_MARKER_TOKEN##*:}" >&2
 
+print_wake_brief "$RAW_ROWS"
 (print_status_presentation "$RAW_ROWS") || true
 assert_watcher_liveness
 exit 0
