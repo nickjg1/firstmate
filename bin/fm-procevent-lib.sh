@@ -344,15 +344,21 @@ fm_procevent_claim_state_root_field_valid() {  # <canonical-state-root>
 
 fm_procevent_claim_state_root_identity() {  # <state-root>
   local state=$1 canonical device inode owner mode
-  fm_procevent_private_directory_valid "$state" 0 || return 1
-  canonical=$(cd -P -- "$state" && pwd -P) || return 1
-  [ "$canonical" = "$(fm_procevent_path_normalize "$state")" ] || return 1
+  canonical=$(fm_procevent_state_root_resolve "$state") || return 1
   fm_procevent_claim_state_root_field_valid "$canonical" || return 1
   device=$(fm_pr_file_device "$canonical") || return 1
   inode=$(fm_pr_file_inode "$canonical") || return 1
   owner=$(id -u) || return 1
   mode=$(fm_pr_file_mode "$canonical") || return 1
   printf '%s\t%s\t%s\t%s\t%s\n' "$canonical" "$device" "$inode" "$owner" "$mode"
+}
+
+fm_procevent_claim_owned_by_state() {  # <state-root> <legacy-home>
+  if [ -n "${FM_PROCEVENT_CLAIM_STATE_ROOT:-}" ]; then
+    [ "$FM_PROCEVENT_CLAIM_STATE_ROOT" = "$1" ]
+  else
+    [ "$FM_PROCEVENT_CLAIM_HOME" = "$2" ]
+  fi
 }
 
 fm_procevent_claim_recorded_state_root_valid() {
@@ -372,6 +378,33 @@ fm_procevent_claim_capture_reservation_remove_locked() {
   [ -n "${FM_PROCEVENT_CLAIM_STATE_ROOT:-}" ] || return 0
   fm_procevent_claim_recorded_state_root_valid || return 1
   fm_procevent_capture_reservation_remove_claim "$FM_PROCEVENT_CLAIM_STATE_ROOT" "$FM_PROCEVENT_CLAIM_TOKEN"
+}
+
+# fm_procevent_claim_generation_gone_locked
+# True only when the loaded claim's owner is stale and the process group it led
+# independently has no members left. The separate group check also covers a
+# reused live pid whose identity differs while the old generation survives.
+# A live matched owner (state 0), an unreadable identity (state 2), and a
+# crashed leader whose owned group is still running (state 3) all return false.
+fm_procevent_claim_generation_gone_locked() {
+  local state=0
+  fm_procevent_pid_state "${FM_PROCEVENT_CLAIM_PID:-}" "${FM_PROCEVENT_CLAIM_IDENTITY:-}" || state=$?
+  [ "$state" -eq 1 ] \
+    && ! fm_procevent_group_alive "${FM_PROCEVENT_CLAIM_PID:-}"
+}
+
+# Capture-reservation cleanup for a claim being reclaimed.
+#
+# Reservation records are keyed by CLAIM TOKEN, and every replacement claims a
+# fresh token, so a dead generation's leftovers can never collide with the
+# generation that replaces it. They are hygiene, not an ownership invariant -
+# the runner's own successful-capture path already tidies them best-effort.
+# The cleanup is still attempted and remains authoritative for a generation
+# that is not provably gone; it stops being a veto only after the stale owner
+# and independent group check prove the whole generation gone.
+fm_procevent_claim_capture_reservation_reclaim_locked() {
+  fm_procevent_claim_capture_reservation_remove_locked && return 0
+  fm_procevent_claim_generation_gone_locked
 }
 
 # fm_procevent_group_alive <pid>
@@ -424,10 +457,10 @@ fm_procevent_claim_state_locked() {
   fm_procevent_pid_state "$FM_PROCEVENT_CLAIM_PID" "$FM_PROCEVENT_CLAIM_IDENTITY"
 }
 
-# fm_procevent_claim_acquire_locked <source-id> <home> <pid> <registration>
+# fm_procevent_claim_acquire_locked <source-id> <home> <pid> <registration> <state-root>
 # 0 acquired, 1 error, 2 held by a live owner (possibly another home).
 fm_procevent_claim_acquire_locked() {
-  local id=$1 home=$2 pid=$3 registration=$4 root claim tmp identity token status claim_state old_home old_token old_reg_dir reg_dir reg_identity stage state state_root state_device state_inode state_owner state_mode
+  local id=$1 home=$2 pid=$3 registration=$4 state=$5 root claim tmp identity token status claim_state old_home old_token old_reg_dir reg_dir reg_identity stage state_root state_device state_inode state_owner state_mode
   fm_procevent_source_id_valid "$id" || return 1
   [ -f "$registration" ] && [ ! -L "$registration" ] || return 1
   reg_dir=${registration%/*}
@@ -463,7 +496,7 @@ fm_procevent_claim_acquire_locked() {
             fi
           fi
           if [ "$status" -eq 0 ]; then
-            fm_procevent_claim_capture_reservation_remove_locked || status=1
+            fm_procevent_claim_capture_reservation_reclaim_locked || status=1
           fi
           [ "$status" -ne 0 ] || rm -f -- "$claim" || status=1
         else
@@ -480,7 +513,6 @@ fm_procevent_claim_acquire_locked() {
     tmp=$(umask 077; mktemp "$root/.claim.XXXXXX") || status=1
   fi
   if [ "$status" -eq 0 ]; then
-    state=${FM_STATE_OVERRIDE:-$home/state}
     IFS=$'\t' read -r state_root state_device state_inode state_owner state_mode \
       < <(fm_procevent_claim_state_root_identity "$state") || status=1
   fi
@@ -539,8 +571,28 @@ fm_procevent_claim_mark_terminal_locked() {
 }
 
 # fm_procevent_claim_release_locked <source-id> <home> <pid> <token>
+# The live owner uses this path for its own release. Reservation cleanup must
+# succeed normally; stale-generation relaxation is never consulted.
 fm_procevent_claim_release_locked() {
-  local id=$1 home=$2 pid=$3 token=$4 claim
+  fm_procevent_claim_release_mode_locked release "$@"
+}
+
+# fm_procevent_claim_release_terminal_self_locked <source-id> <home> <pid> <token>
+# A live runner uses this only while retiring its own terminal source mid-capture.
+# Its in-flight reservation is transient, so attempt cleanup without making that
+# cleanup a veto; exact ownership still must match before releasing the claim.
+fm_procevent_claim_release_terminal_self_locked() {
+  fm_procevent_claim_release_mode_locked terminal-self "$@"
+}
+
+# fm_procevent_claim_reclaim_locked <source-id> <home> <pid> <token>
+# Lifecycle commands use this only after proving or stopping a dead generation.
+fm_procevent_claim_reclaim_locked() {
+  fm_procevent_claim_release_mode_locked reclaim "$@"
+}
+
+fm_procevent_claim_release_mode_locked() {
+  local mode=$1 id=$2 home=$3 pid=$4 token=$5 claim
   fm_procevent_source_id_valid "$id" || return 1
   claim=$(fm_procevent_claim_path "$id")
   [ -e "$claim" ] || return 0
@@ -548,7 +600,18 @@ fm_procevent_claim_release_locked() {
     && [ "$FM_PROCEVENT_CLAIM_HOME" = "$home" ] \
     && [ "$FM_PROCEVENT_CLAIM_PID" = "$pid" ] \
     && [ "$FM_PROCEVENT_CLAIM_TOKEN" = "$token" ]; then
-    fm_procevent_claim_capture_reservation_remove_locked || return 1
+    case "$mode" in
+      reclaim)
+        fm_procevent_claim_capture_reservation_reclaim_locked || return 1
+        ;;
+      terminal-self)
+        fm_procevent_claim_capture_reservation_remove_locked || true
+        ;;
+      release)
+        fm_procevent_claim_capture_reservation_remove_locked || return 1
+        ;;
+      *) return 1 ;;
+    esac
     rm -f -- "$claim"
     return $?
   fi
@@ -579,11 +642,26 @@ fm_procevent_path_normalize() {
 fm_procevent_directory_owned_by_current_user() {
   local owner
   if [ "$(uname)" = Darwin ]; then
-    owner=$(stat -f %u "$1" 2>/dev/null)
+    owner=$(/usr/bin/stat -f %u "$1" 2>/dev/null)
   else
     owner=$(stat -c %u "$1" 2>/dev/null)
   fi
   [ "$owner" = "$(id -u)" ]
+}
+
+# fm_procevent_state_root_resolve <state-root>
+# Print the physical private directory this module operates on, or fail. A home
+# is legitimately spelled through a symlinked ancestor - /tmp and $TMPDIR are
+# symlinks on macOS - so the caller's spelling is resolved exactly once here and
+# every derived path, recorded claim identity, and later confinement check uses
+# the physical root instead. Resolving before validating is what makes the
+# private-directory contract hold for the directory actually operated on, rather
+# than only for callers that already spelled it physically.
+fm_procevent_state_root_resolve() {  # <state-root>
+  local state=$1 canonical
+  canonical=$(CDPATH='' cd -P -- "$state" 2>/dev/null && pwd -P) || return 1
+  fm_procevent_private_directory_valid "$canonical" 0 || return 1
+  printf '%s\n' "$canonical"
 }
 
 fm_procevent_private_directory_valid() {
@@ -604,7 +682,7 @@ fm_procevent_private_directory_valid() {
 
 fm_procevent_capture_inbox_prepare() {
   local state=$1 inbox
-  fm_procevent_private_directory_valid "$state" 0 || return 1
+  state=$(fm_procevent_state_root_resolve "$state") || return 1
   inbox=$(fm_procevent_inbox_dir "$state")
   if [ ! -e "$inbox" ] && [ ! -L "$inbox" ]; then
     (umask 077; mkdir "$inbox") || return 1
@@ -613,16 +691,20 @@ fm_procevent_capture_inbox_prepare() {
   printf '%s\n' "$inbox"
 }
 
+# Print the validated physical registry directory, like the inbox and
+# reservation preparers beside it, so a caller that pins the boundary with
+# `pwd -P` compares against the same physical path this validated.
 fm_procevent_extension_staging_prepare() {
   local state=$1 registry
-  fm_procevent_private_directory_valid "$state" 0 || return 1
+  state=$(fm_procevent_state_root_resolve "$state") || return 1
   registry=$(fm_procevent_registry_dir "$state")
-  fm_procevent_private_directory_valid "$registry" 1
+  fm_procevent_private_directory_valid "$registry" 1 || return 1
+  printf '%s\n' "$registry"
 }
 
 fm_procevent_capture_reservation_prepare() {
   local state=$1 reservation
-  fm_procevent_private_directory_valid "$state" 0 || return 1
+  state=$(fm_procevent_state_root_resolve "$state") || return 1
   reservation=$(fm_procevent_capture_reservation_dir "$state")
   if [ ! -e "$reservation" ] && [ ! -L "$reservation" ]; then
     (umask 077; mkdir "$reservation") || return 1

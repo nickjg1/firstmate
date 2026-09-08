@@ -138,7 +138,7 @@ hold_source_lock_then_handle() {  # <home> <source-id> <sequence> <ready-file> <
 }
 
 # --- inert with nothing configured ------------------------------------------
-IDLE="$TMP_ROOT/idle"; new_home "$IDLE"
+IDLE="$TMP_ROOT/idle"; mkdir -p "$IDLE"
 out=$(pe "$IDLE" list)
 assert_contains "$out" "no sources registered" "an unconfigured home reports no sources"
 out=$(pe "$IDLE" reconcile)
@@ -151,7 +151,7 @@ sup=$(PATH="${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" bash -c \
 assert_contains "$sup" no "an unconfigured home does not need supervision"
 
 # --- a blocking source completes into exactly one normalized event ----------
-H1="$TMP_ROOT/h1"; new_home "$H1"
+H1="$TMP_ROOT/h1"; mkdir -p "$H1"
 TRIG="$TMP_ROOT/trigger-one"
 out=$(pe_register "$H1" lavish src-one -- "$BLOCKER" "$TRIG" "payload one")
 assert_contains "$out" "registered: src-one" "register records a source"
@@ -184,6 +184,30 @@ assert_contains "$mode" 600 "the captured result is private"
 assert_grep 'payload one' "$RESULT" "the captured result holds the source output verbatim"
 assert_grep 'lavish' "${RESULT%.result}.adapter" "the captured result retains its immutable adapter"
 assert_absent "${RESULT%.result}.handled" "publication alone never marks a result handled"
+
+# --- a home spelled through a symlinked ancestor still runs its sources ------
+# Such a home must run process-event sources exactly like a physically spelled
+# one: reconcile's detached runner discards its own stderr, so a refusal here is
+# invisible to the caller and the source simply never fires.
+HPHYS="$TMP_ROOT/symlinked-parent-target"
+mkdir -p "$HPHYS"
+ln -s "$HPHYS" "$TMP_ROOT/symlinked-parent"
+HSYM="$TMP_ROOT/symlinked-parent/home"; new_home "$HSYM"
+SYM_TRIGGER="$TMP_ROOT/symlink-trigger"
+pe_register "$HSYM" lavish symlinked-src -- "$BLOCKER" "$SYM_TRIGGER" "symlinked payload" >/dev/null
+pe "$HSYM" reconcile >/dev/null
+wait_for "$FM_PROCEVENT_CLAIM_ROOT/symlinked-src.claim" \
+  || fail "a home reached through a symlinked ancestor never claimed its source"
+: > "$SYM_TRIGGER"
+wait_for "$HSYM/state/.wake-queue" \
+  || fail "a home reached through a symlinked ancestor published no event"
+assert_contains "$(wake_payloads "$HSYM")" "procevent lavish symlinked-src 1" \
+  "the symlinked-ancestor home publishes the committed result sequence"
+SYM_RESULT=$(first_result "$HSYM" symlinked-src || true)
+[ -n "$SYM_RESULT" ] || fail "the symlinked-ancestor home captured no durable result"
+assert_grep 'symlinked payload' "$SYM_RESULT" \
+  "the symlinked-ancestor home captures the source output verbatim"
+pass "a home reached through a symlinked ancestor runs its sources normally"
 
 # --- the public start boundary establishes generation group ownership -------
 HPG="$TMP_ROOT/hpg"; new_home "$HPG"
@@ -1126,6 +1150,141 @@ wait_for "$DEAD_LOG" || fail "the replacement source never started for a truly d
 : > "$DEAD_TRIGGER"
 pe "$HG2" retire dead-gen-src >/dev/null
 pass "a truly dead generation with no surviving group is still safely reclaimed"
+
+# --- a dead generation stays reclaimable when the state root cannot be
+# revalidated -----------------------------------------------------------------
+# The reported wedge. Reclaiming a dead generation ran the claim's
+# capture-reservation cleanup first, and that cleanup re-verifies the recorded
+# state-root identity. Once that identity stopped matching, a claim naming a pid
+# and a process group that were both provably gone could not be cleared:
+# reconcile kept reporting a start while nothing ever attached, and retire
+# refused with "cannot release source ownership". Reservation records are keyed
+# by claim token and a replacement always claims a fresh one, so they can never
+# collide with the generation that replaces them - they are hygiene, not an
+# ownership invariant, and they must not veto an ownership move that the
+# documented promise already grants.
+#
+# The claim below is the modern shape (it carries the state-root identity block
+# a legacy claim does not have), which is why the existing dead-generation case
+# above never reached this path.
+HSR="$TMP_ROOT/hsr"; new_home "$HSR"
+SR_TRIGGER="$TMP_ROOT/state-root-trigger"
+SR_LOG="$TMP_ROOT/state-root-executions"
+pe_register "$HSR" lavish state-root-src -- "$RACE_BLOCKER" "$SR_LOG" "$SR_TRIGGER" >/dev/null
+pe "$HSR" reconcile >/dev/null
+wait_for "$FM_PROCEVENT_CLAIM_ROOT/state-root-src.claim" \
+  || fail "state-root fixture never claimed its source"
+wait_for "$SR_LOG" || fail "state-root fixture source never started"
+sr_leader=$(sed -n '2p' "$FM_PROCEVENT_CLAIM_ROOT/state-root-src.claim")
+case "$sr_leader" in ''|*[!0-9]*) fail "could not read the state-root fixture leader pid" ;; esac
+[ -n "$(sed -n '8p' "$FM_PROCEVENT_CLAIM_ROOT/state-root-src.claim")" ] \
+  || fail "fixture invalid: the claim carries no state-root identity to invalidate"
+
+kill -KILL -"$sr_leader" 2>/dev/null || true
+kill -KILL "$sr_leader" 2>/dev/null || true
+for _ in $(seq 1 50); do kill -0 -"$sr_leader" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$sr_leader" 2>/dev/null && fail "the state-root fixture leader survived SIGKILL"
+kill -0 -"$sr_leader" 2>/dev/null && fail "fixture invalid: the owned group outlived the whole generation"
+# Drift the live state root away from what the claim recorded.
+chmod 750 "$HSR/state" || fail "could not drift the state-root identity"
+
+sr_out=$(pe "$HSR" reconcile)
+assert_contains "$sr_out" "started=1" "a dead generation was not reclaimed after the state root drifted: $sr_out"
+# Reporting a start is not the same fact as listening: the previous behavior
+# reported exactly this while the replacement silently failed to claim.
+wait_for_lines "$SR_LOG" 2 \
+  || fail "reconcile reported a start but no replacement source ever ran: $(cat "$SR_LOG")"
+sr_new=$(sed -n '2p' "$FM_PROCEVENT_CLAIM_ROOT/state-root-src.claim")
+[ "$sr_new" != "$sr_leader" ] || fail "the dead generation's claim was never replaced"
+kill -0 "$sr_new" 2>/dev/null || fail "the replacement runner did not take ownership"
+: > "$SR_TRIGGER"
+pe "$HSR" retire state-root-src >/dev/null
+pass "reconcile reclaims a dead generation whose state-root identity no longer matches"
+
+# Retire must release the same wedged claim rather than refusing forever.
+HSR2="$TMP_ROOT/hsr2"; new_home "$HSR2"
+pe_register "$HSR2" lavish wedged-src -- /bin/echo recovered >/dev/null
+sr2_identity=$(bash -c '. "$1/bin/fm-pr-lib.sh"; fm_pr_file_identity "$2"' _ \
+  "$ROOT" "$HSR2/state/procevent/wedged-src.source") \
+  || fail "could not read the wedged fixture registration identity"
+{
+  printf '%s\n%s\nwedged-token\nwedged-identity\n' "$HSR2" 999999
+  printf '%s\n%s\nactive\n' "$HSR2/state/procevent" "$sr2_identity"
+  # A state-root identity that names the right directory with the wrong inode:
+  # exactly what a claim recorded before its home was re-created looks like.
+  printf '%s\n%s\n%s\n%s\n%s\n' "$HSR2/state" 1 1 "$(id -u)" 755
+} > "$FM_PROCEVENT_CLAIM_ROOT/wedged-src.claim"
+chmod 0600 "$FM_PROCEVENT_CLAIM_ROOT/wedged-src.claim"
+wedged_out=$(pe "$HSR2" retire wedged-src 2>&1) \
+  || fail "retire refused to release a claim whose whole generation is gone: $wedged_out"
+assert_contains "$wedged_out" "retired: wedged-src" "retire did not report releasing the wedged source: $wedged_out"
+assert_absent "$FM_PROCEVENT_CLAIM_ROOT/wedged-src.claim" "retire left the dead generation owning the source"
+assert_absent "$HSR2/state/procevent/wedged-src.source" "retire left the wedged source registered"
+pass "retire releases a dead generation's claim instead of refusing forever"
+
+# The guard is not weakened in the other direction: the same unrevalidatable
+# state root must NOT let anything take a source away from a live generation.
+HSR3="$TMP_ROOT/hsr3"; new_home "$HSR3"
+SR3_TRIGGER="$TMP_ROOT/state-root-live-trigger"
+SR3_LOG="$TMP_ROOT/state-root-live-executions"
+pe_register "$HSR3" lavish live-drift-src -- "$RACE_BLOCKER" "$SR3_LOG" "$SR3_TRIGGER" >/dev/null
+pe "$HSR3" reconcile >/dev/null
+wait_for "$FM_PROCEVENT_CLAIM_ROOT/live-drift-src.claim" \
+  || fail "live-drift fixture never claimed its source"
+wait_for "$SR3_LOG" || fail "live-drift fixture source never started"
+sr3_leader=$(sed -n '2p' "$FM_PROCEVENT_CLAIM_ROOT/live-drift-src.claim")
+chmod 750 "$HSR3/state" || fail "could not drift the live owner's state-root identity"
+sr3_out=$(pe "$HSR3" start live-drift-src)
+assert_contains "$sr3_out" "already owned" "a live generation was displaced after its state root drifted: $sr3_out"
+[ "$(sed -n '2p' "$FM_PROCEVENT_CLAIM_ROOT/live-drift-src.claim")" = "$sr3_leader" ] \
+  || fail "the live generation's claim was replaced"
+kill -0 "$sr3_leader" 2>/dev/null || fail "the live owner was killed by a reclaim attempt"
+sr3_reconcile=$(pe "$HSR3" reconcile)
+assert_contains "$sr3_reconcile" "started=0" "reconcile started a second poller beside a live owner: $sr3_reconcile"
+[ "$(wc -l < "$SR3_LOG" | tr -d ' ')" = 1 ] \
+  || fail "a second source ran beside the live owner: $(cat "$SR3_LOG")"
+: > "$SR3_TRIGGER"
+pe "$HSR3" retire live-drift-src >/dev/null
+pass "a live generation is never reclaimed, drifted state root or not"
+
+HSR4="$TMP_ROOT/hsr4"; new_home "$HSR4"
+SR4_TRIGGER="$TMP_ROOT/state-root-reused-trigger"
+SR4_LOG="$TMP_ROOT/state-root-reused-executions"
+pe_register "$HSR4" lavish reused-group-src -- "$RACE_BLOCKER" "$SR4_LOG" "$SR4_TRIGGER" >/dev/null
+pe "$HSR4" reconcile >/dev/null
+wait_for "$FM_PROCEVENT_CLAIM_ROOT/reused-group-src.claim" \
+  || fail "reused-group fixture never claimed its source"
+wait_for "$SR4_LOG" || fail "reused-group fixture source never started"
+sr4_claim="$FM_PROCEVENT_CLAIM_ROOT/reused-group-src.claim"
+sr4_leader=$(sed -n '2p' "$sr4_claim")
+sr4_identity=$(sed -n '4p' "$sr4_claim")
+kill -0 -"$sr4_leader" 2>/dev/null \
+  || fail "fixture invalid: the reused-pid process group is not alive"
+awk 'NR == 4 { print "different-live-process-identity"; next } { print }' \
+  "$sr4_claim" > "$sr4_claim.tmp" && mv "$sr4_claim.tmp" "$sr4_claim"
+chmod 0600 "$sr4_claim"
+chmod 750 "$HSR4/state" || fail "could not drift the reused-group state root"
+sr4_out=$(pe "$HSR4" reconcile)
+sleep 0.5
+[ "$(wc -l < "$SR4_LOG" | tr -d ' ')" = 1 ] \
+  || fail "reconcile started a replacement beside a reused pid's live group: $sr4_out"
+[ "$(sed -n '2p' "$sr4_claim")" = "$sr4_leader" ] \
+  || fail "reconcile replaced the reused-pid generation's claim"
+set +e
+sr4_retire=$(pe "$HSR4" retire reused-group-src 2>&1)
+sr4_rc=$?
+set -e
+[ "$sr4_rc" -ne 0 ] || fail "retire released a claim whose process group survives: $sr4_retire"
+[ -e "$sr4_claim" ] || fail "retire removed the reused-pid generation's claim"
+[ -e "$HSR4/state/procevent/reused-group-src.source" ] \
+  || fail "retire removed the reused-pid generation's registration"
+awk -v identity="$sr4_identity" 'NR == 4 { print identity; next } { print }' \
+  "$sr4_claim" > "$sr4_claim.tmp" && mv "$sr4_claim.tmp" "$sr4_claim"
+chmod 0600 "$sr4_claim"
+chmod 755 "$HSR4/state"
+: > "$SR4_TRIGGER"
+pe "$HSR4" retire reused-group-src >/dev/null
+pass "a reused pid never makes its surviving process group reclaimable"
 
 HJ="$TMP_ROOT/hj"; new_home "$HJ"
 TORN_TRIGGER="$TMP_ROOT/torn-trigger"
