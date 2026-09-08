@@ -300,6 +300,44 @@ status_line_verb() {  # <status-line> -> leading verb word
   done
   printf '%s' "$out"
 }
+
+# THE status-verb -> canonical-state mapping. It lives here rather than in one
+# consumer because several readers need it: bin/fm-crew-state.sh's no-run
+# fallback and bin/fm-wake-brief.sh when no crew-state read is available. A verb
+# with no run-state meaning - the decision-closing `resolved` and the
+# captain-held transfer verb - maps to `unknown`, which is what lets callers use
+# this verdict as their "not a state" test instead of keeping a second verb list.
+map_log_state() {  # <status-line> -> working|parked|blocked|paused|done|failed|unknown
+  # The VERB is configurable (FM_CLASSIFY_PAUSED_VERB); the canonical STATE it
+  # maps to is always `paused`, so a home with a custom verb still reports a
+  # state name every consumer recognizes.
+  if status_is_paused "$1"; then
+    printf 'paused'
+    return
+  fi
+  case "$(status_line_verb "$1")" in
+    working)        printf 'working' ;;
+    needs-decision) printf 'parked' ;;
+    blocked)        printf 'blocked' ;;
+    done)           printf 'done' ;;
+    failed)         printf 'failed' ;;
+    *)              printf 'unknown' ;;
+  esac
+}
+
+# Which TERMINAL outcome a crew-state line reports, for the readers that must
+# choose between "relay the PR and merge it" and "the PR is already gone, tear
+# down". bin/fm-crew-state.sh owns the detail strings this reads; anything else
+# is `unknown`, which callers render as an ambiguous outcome rather than
+# guessing an irreversible next action.
+terminal_outcome() {  # <state/detail line> -> checks-passed|passed|unknown
+  case "$1" in
+    *"checks green: PR ready for review"*) printf 'checks-passed' ;;
+    *"run passed: PR merged/closed"*) printf 'passed' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # 0 when a complete "[key=...]" token sits in the documented position before
 # the line's first colon (or anywhere on a line that has no colon at all).
 _fm_key_before_colon() {  # <status-line>

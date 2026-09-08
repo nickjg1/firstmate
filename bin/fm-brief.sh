@@ -56,6 +56,11 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
+# Every scaffold also carries the decision-cost contract, which is THE owner of
+# how many supervisor turns a crew is allowed to cost: batch every pending
+# question into ONE needs-decision instead of serializing them, and (for
+# no-mistakes ship briefs, via bin/fm-dod-lib.sh) treat pipeline-auto-fixable
+# findings as already authorized rather than escalating them.
 # Every scaffold also carries the steering-inbox receive-and-ack section:
 # process state/<id>.inbox/*.msg in order and acknowledge each by moving it to
 # handled/ (record, doorbell, and ladder owned by bin/fm-task-inbox-lib.sh).
@@ -284,6 +289,7 @@ States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own; use \`blocked:\` when you are stuck and need firstmate to act.
 Use this only for material phase changes, a captain decision, a real blocker, a failure, work ready for review, or work you landed.
 Work you landed includes a merge you performed yourself under standing merge authority and one the captain merged on the forge: under that authority nothing is ever \"ready for review\", so a landed merge that goes unreported reaches the captain as silence.
+Batch decisions: every escalation costs the main firstmate a full turn, so gather every question already pending or clearly coming into ONE numbered \`needs-decision\` line rather than sending them one at a time.
 This is also how you return the answer to a marked from-firstmate request above.
 A marked request requires one correlated answer after the work; it does not require a separate receipt or start acknowledgement.
 Never append \`working:\` merely to acknowledge receipt or announce that a marked request has started.
@@ -387,6 +393,11 @@ The report is the only thing that survives, so anything worth keeping must be in
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+   **Batch your questions.** Every \`needs-decision\` costs a full supervisor turn, so before you
+   stop, look ahead for every other question already pending or clearly coming, and put them in ONE
+   numbered \`needs-decision\` line. Never serialize one question per append when you could have asked
+   them together. Decide as much as you legitimately can yourself first: anything the task, the brief,
+   or an existing convention already answers is not a decision - it is work.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
@@ -477,6 +488,11 @@ $RULE1
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+   **Batch your questions.** Every \`needs-decision\` costs a full supervisor turn, so before you
+   stop, look ahead for every other question already pending or clearly coming, and put them in ONE
+   numbered \`needs-decision\` line. Never serialize one question per append when you could have asked
+   them together. Decide as much as you legitimately can yourself first: anything the task, the brief,
+   or an existing convention already answers is not a decision - it is work.
 $ASK_USER_BLOCK
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.

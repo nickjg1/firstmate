@@ -220,6 +220,9 @@ printf '%s' "$OUT" | grep -F -- '--- wake brief' >/dev/null && fail "FM_WAKE_BRI
 pass "the drain prints durable records unchanged, appends the brief, and honors FM_WAKE_BRIEF=0"
 
 # An empty queue drains silently, brief and all - a quiet drain stays quiet.
+# Presented rows stay durable until they are acknowledged, so the queue is
+# cleared here rather than assumed emptied by the drains above.
+reset_state
 OUT=$(FM_STATE_OVERRIDE="$STATE" "$DRAIN" 2>/dev/null)
 [ -z "$OUT" ] || fail "an empty drain must print nothing at all, got: $OUT"
 pass "an empty drain stays silent"
